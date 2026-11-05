@@ -126,8 +126,15 @@ func (s *Server) telegram(msg string){
  token:=os.Getenv("TG_BOT_TOKEN");chat:=os.Getenv("TG_CHAT_ID");if token==""||chat==""{return}
  form:=url.Values{"chat_id":{chat},"text":{msg}}
  ctx,cancel:=context.WithTimeout(context.Background(),10*time.Second);defer cancel()
- req,e:=http.NewRequestWithContext(ctx,"POST","https://api.telegram.org/bot"+token+"/sendMessage",strings.NewReader(form.Encode()));if e!=nil{return}
+ base:=env("TG_API_BASE_URL","https://api.telegram.org")
+ req,e:=http.NewRequestWithContext(ctx,"POST",strings.TrimRight(base,"/")+"/bot"+token+"/sendMessage",strings.NewReader(form.Encode()));if e!=nil{return}
  req.Header.Set("Content-Type","application/x-www-form-urlencoded");resp,e:=s.client.Do(req);if e==nil{resp.Body.Close()}
+}
+func alertsFor(next Snapshot)string{
+ alarms:=[]string{}
+ for _,v:=range []struct{Name string;Value float64;Limit int}{{"cpu",next.CPU,number("ALERT_CPU_PERCENT",90)},{"memory",next.Memory,number("ALERT_MEMORY_PERCENT",90)},{"disk",next.Disk,number("ALERT_DISK_PERCENT",90)}}{if v.Value>=float64(v.Limit){alarms=append(alarms,v.Name)}}
+ if next.Service!="active"{alarms=append(alarms,"service")}
+ return strings.Join(alarms,",")
 }
 func (s *Server) poll(ctx context.Context){
  items,e:=s.instances(ctx);if e!=nil{log.Printf("monitor: Linode list unavailable: %v",e);return}
@@ -138,14 +145,11 @@ func (s *Server) poll(ctx context.Context){
    c,cancel:=context.WithTimeout(ctx,20*time.Second);output,err:=ssh(c,publicIP(inst),probeScript);cancel()
    if err==nil{
     var v struct{CPU float64 `json:"cpu"`;Memory float64 `json:"memory"`;Disk float64 `json:"disk"`;Uptime float64 `json:"uptime"`;Service string `json:"service"`}
-    if json.Unmarshal([]byte(output),&v)==nil{next.State="online";next.CPU=v.CPU;next.Memory=v.Memory;next.Disk=v.Disk;next.Uptime=v.Uptime;next.Service=v.Service}
+    if json.Unmarshal([]byte(output),&v)==nil&&v.CPU>=0&&v.CPU<=100&&v.Memory>=0&&v.Memory<=100&&v.Disk>=0&&v.Disk<=100&&v.Uptime>=0{next.State="online";next.CPU=v.CPU;next.Memory=v.Memory;next.Disk=v.Disk;next.Uptime=v.Uptime;next.Service=v.Service}
    }
   }
   if next.State=="offline"{next.Failures=old.Failures+1;if next.Failures>=number("ALERT_FAILURE_COUNT",3){next.Alert="offline"}}else{
-   alarms:=[]string{}
-   for _,v:=range []struct{Name string;Value float64;Limit int}{{"cpu",next.CPU,number("ALERT_CPU_PERCENT",90)},{"memory",next.Memory,number("ALERT_MEMORY_PERCENT",90)},{"disk",next.Disk,number("ALERT_DISK_PERCENT",90)}}{if v.Value>=float64(v.Limit){alarms=append(alarms,v.Name)}}
-   if next.Service!="active"{alarms=append(alarms,"service")}
-   next.Alert=strings.Join(alarms,",")
+   next.Alert=alertsFor(next)
   }
   s.mu.Lock();s.status[inst.ID]=next;s.mu.Unlock()
   if next.Alert!=old.Alert{

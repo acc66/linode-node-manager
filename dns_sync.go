@@ -2,12 +2,9 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net"
-	"net/http"
 	"net/url"
 	"strings"
 )
@@ -181,38 +178,9 @@ func (s *Server) prepareDeploymentDNS(ctx context.Context, base, token string, t
 	if !active {
 		return false, "", nil
 	}
-	request, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(base, "/")+fmt.Sprintf("/api/v1/server/UniProxy/config?node_id=%d", target), nil)
+	domain, err := s.wp2NodeDomain(ctx, base, token, target)
 	if err != nil {
-		return false, "", errors.New("wp2 节点配置地址无效")
-	}
-	request.Header.Set("Authorization", "Bearer "+token)
-	client := *s.client
-	client.Jar = nil
-	client.CheckRedirect = func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }
-	resp, err := client.Do(request)
-	if err != nil {
-		return false, "", errors.New("自动 DNS 无法读取 wp2 节点配置")
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return false, "", fmt.Errorf("自动 DNS 读取 wp2 配置 HTTP %d", resp.StatusCode)
-	}
-	var config struct {
-		Domain      string `json:"domain"`
-		ServerName  string `json:"server_name"`
-		TLSSettings struct {
-			ServerName string `json:"server_name"`
-		} `json:"tls_settings"`
-	}
-	if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&config) != nil {
-		return false, "", errors.New("wp2 节点配置格式无效")
-	}
-	domain := config.TLSSettings.ServerName
-	if domain == "" {
-		domain = config.ServerName
-	}
-	if domain == "" {
-		domain = config.Domain
+		return false, "", err
 	}
 	if domain == "" || net.ParseIP(domain) != nil {
 		return false, "未识别到可自动解析的节点域名，交由节点安装检查。\n", nil
@@ -250,5 +218,10 @@ func (s *Server) prepareDeploymentDNS(ctx context.Context, base, token string, t
 	if err != nil {
 		return false, "", fmt.Errorf("自动 DNS 未完成，记录可能已部分更新：%w", err)
 	}
-	return true, fmt.Sprintf("自动 DNS 已更新 %s（%s），A/AAAA 指向所选实例，等待解析生效。\n", domain, provider.Provider), nil
+	return true, fmt.Sprintf("自动 DNS 已更新 %s（%s）：A=%s，AAAA=%s；等待解析生效。\n", domain, provider.Provider, ipv4, func() string {
+		if ipv6 == "" {
+			return "无 IPv6，已清理旧 AAAA"
+		}
+		return ipv6
+	}()), nil
 }

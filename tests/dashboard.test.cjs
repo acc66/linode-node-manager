@@ -6,7 +6,8 @@ const instance={id:5,account_id:'legacy',label:'Japan server',status:'running',i
 const responses={'/accounts':{accounts:[{id:'legacy',name:'我的 Linode 账号'}]},'/instances':{instances:[instance]},'/telegram/settings':{configured:false,enabled:false,chat_id:''},'/dns/providers':{providers:[]},'/monitor':{instances:[]},'/wp2/nodes':{nodes:Array.from({length:55},(_,index)=>({id:929+index,name:'日本节点'+index,sort:'Hysteria2'}))},'/catalog/regions':{data:[{id:'jp-osa',label:'Osaka'}]},'/catalog/types':{data:[{id:'g6-nanode-1',label:'Nanode',price:{monthly:5,hourly:0.0075}}]},'/catalog/images':{data:[{id:'linode/debian12',label:'Debian 12'}]},'/instances/5/password':{root_pass:'mock-password'}};
 const context={document:{getElementById:get,createElement:el},confirm:()=>true,prompt:()=>promptValue,setInterval(){},setTimeout,
 fetch:async(path,options)=>{calls.push({path,options});const key=path.slice(4).split('?')[0];let data;
-if(key==='/telegram/settings'&&options.method==='POST')data={saved:true};
+if(key==='/dns/discover')data={zones:['example.com'],suggested_zone:'example.com',node_domain:'jp.example.com'};
+else if(key==='/telegram/settings'&&options.method==='POST')data={saved:true};
 else if(key==='/telegram/test')data={message:'测试消息已发送'};
 else if(key==='/dns/providers'&&options.method==='POST')data={saved:true};
 else if(key==='/wp2/session'){if(options.method==='POST')connected=true;if(options.method==='DELETE')connected=false;data={connected}}
@@ -19,10 +20,10 @@ else {assert(key in responses,key);data=responses[key]}
 return {ok:true,json:async()=>data};}};
 vm.createContext(context);vm.runInContext(source,context);const tick=()=>new Promise(setImmediate);
 (async()=>{
-await tick();assert.equal(get('account').value,'legacy');assert.equal(get('instance').value,'5');assert(get('instances').innerHTML.includes('我的 Linode 账号'));assert(get('instances').innerHTML.includes('192.0.2.1'));assert(get('instances').innerHTML.includes('jp-osa'));
+await tick();assert.equal(get('account').value,'legacy');assert.equal(get('instance').value,'5');assert(get('instances').innerHTML.includes('我的 Linode 账号'));assert(get('instances').innerHTML.includes('192.0.2.1'));assert(get('instances').innerHTML.includes('jp-osa'));assert(get('dnstarget').textContent.includes('192.0.2.1'));
 get('wp2email').value='admin@example.com';get('wp2password').value='mock-login-password';get('wp2code').value='123456';await context.connectWP2();assert.equal(connected,true);assert.equal(get('wp2password').value,'');assert.equal(get('wp2code').value,'');assert.equal(get('node').options.length,56);assert.equal((get('nodes').innerHTML.match(/<tr>/g)||[]).length,11);assert(get('nodespage').textContent.includes('/ 6'));get('nodesearch').value='929';context.renderNodes();assert.equal((get('nodes').innerHTML.match(/<tr>/g)||[]).length,2);get('nodesearch').value='';context.renderNodes();
 get('tgtoken').value='123456:mock-test-token-123456789012345';get('tgchat').value='-100123456';get('tgenabled').checked=true;await context.saveTelegram();assert.equal(get('tgtoken').value,'');await context.testTelegram();assert.equal(get('tgtest').disabled,false);
-get('dnsprovider').value='cloudflare';get('dnszone').value='example.com';get('dnstoken').value='mock-cf-key';get('dnsenabled').checked=true;await context.saveDNS();assert.equal(get('dnstoken').value,'');
+get('dnsprovider').value='cloudflare';get('dnszone').value='example.com';get('dnstoken').value='mock-cf-key';get('dnsenabled').checked=true;await context.discoverDNS();assert.equal(get('dnszone').value,'example.com');await context.saveDNS();assert.equal(get('dnstoken').value,'');
 get('proxyurl').value='socks5://user:secret@proxy.example:1080';await context.saveProxy();assert.equal(get('proxyurl').value,'');
 await context.catalogs();get('createlabel').value='new-node';get('createregion').value='jp-osa';get('createtype').value='g6-nanode-1';get('createimage').value='linode/debian12';get('createpass').value='mock-root-password';
 const first=context.createInstance();await context.createInstance();await first;

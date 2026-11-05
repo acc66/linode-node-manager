@@ -324,3 +324,13 @@ API 文档：[Cloudflare DNS Record API](https://developers.cloudflare.com/api/r
 如果已选择 wp2 节点，会读取该节点实际域名，并选取能匹配的最长托管域名。节点不属于任何可管理域名时不会自动选一个无关域名，而是明确提示。没有选择节点且只能读取到一个域名时才自动填入该域名。读取不会修改 DNS，也不会在保存前持久保存 Key。
 
 DNS 设置区会显示当前选择的 Linode 实例公网 IP。A 记录指向该实例，不是管理机；有 IPv6 时同步 AAAA，没有时清理该节点的旧 AAAA。安装任务日志会列出实际更新的域名及 A/AAAA 值。
+
+## 21. 连接地址与后端日志
+
+自动 DNS 按 wp2 原始 `server` 字段解析连接地址：优先使用参数 `server=`，存在 `relayserver=` 时遵循 wp2 的中转覆盖规则，没有覆盖参数时使用最前面的地址。WebSocket `host=` 和 TLS SNI 不作为 DNS 更新目标。例如 `jpa9.help600.com;2086;0;ws;;path=/Kugou|server=jpa2.help600.com|host=kugou.com` 只更新 `jpa2.help600.com`，不更新 `kugou.com`。
+
+日志显示连接域名、目标 IPv4/IPv6、服务商和实际更新值。启用自动 DNS 后找不到匹配配置会停止安装；任务的 `dns_status` 区分 `updated`、`skipped`、`failed`。启用自动 DNS 的明文 WS 节点也会检查连接域名是否已解析到目标 IP，而不是仅检查服务端口。
+
+安装期间进度自动刷新，完成或失败时附上 systemd 状态和后端 journal 日志。也可选择服务器后点击“查看后端日志”，只读取日志，不执行重装。日志对面板 Token 和 SSH 密码进行脱敏。首次 SSH 的 known_hosts 提示不会导致日志 JSON 解析失败。
+
+运行中的重复安装会被拦截；安装完成后再次确认会重新部署并重启服务，可能短暂中断。保留原实例更换新 IPv4 的临时实例流程尚未实现，不会因点击安装而触发换 IP 或创建临时实例。

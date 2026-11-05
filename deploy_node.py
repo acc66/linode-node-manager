@@ -31,6 +31,26 @@ def command(*args, check=True):
                           stderr=subprocess.STDOUT, text=True, timeout=240)
 
 
+def wait_node_dns(domain, ip, ipv6='', wait_dns=False):
+    allowed = {ip}
+    if ipv6:
+        allowed.add(ipv6.split('/')[0])
+    deadline = time.monotonic() + (600 if wait_dns else 0)
+    announced = False
+    while True:
+        try:
+            addresses = {item[4][0] for item in socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)}
+        except socket.gaierror:
+            addresses = set()
+        if addresses and addresses <= allowed and ip in addresses:
+            break
+        if time.monotonic() >= deadline:
+            raise ValueError('节点域名 A/AAAA 未全部指向当前实例或 DNS 缓存尚未过期，请稍后重试')
+        if not announced:
+            print('DNS 记录已更新，等待目标服务器解析缓存生效（最多10分钟）…', flush=True)
+            announced = True
+        time.sleep(10)
+
 def node_settings(config, ip, ipv6='', wait_dns=False):
     protocol = str(config.get('server_type') or config.get('protocol') or '').lower()
     if protocol == 'v2ray':
@@ -54,24 +74,7 @@ def node_settings(config, ip, ipv6='', wait_dns=False):
                 raise ValueError('TLS 节点没有有效域名，请先在 wp2 节点配置域名')
         else:
             raise ValueError('自动申请证书需要节点域名，不能使用 IP 或自动退回自签名证书')
-        allowed = {ip}
-        if ipv6:
-            allowed.add(ipv6.split('/')[0])
-        deadline = time.monotonic() + (600 if wait_dns else 0)
-        announced = False
-        while True:
-            try:
-                addresses = {item[4][0] for item in socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)}
-            except socket.gaierror:
-                addresses = set()
-            if addresses and addresses <= allowed and ip in addresses:
-                break
-            if time.monotonic() >= deadline:
-                raise ValueError('节点域名 A/AAAA 未全部指向当前实例或 DNS 缓存尚未过期，请稍后重试')
-            if not announced:
-                print('DNS 记录已更新，等待目标服务器解析缓存生效（最多10分钟）…', flush=True)
-                announced = True
-            time.sleep(10)
+        wait_node_dns(domain, ip, ipv6, wait_dns)
         cert = {'cert_mode': 'http', 'auto_tls': True, 'domain': domain,
                 'http_port': 80, 'cert_dir': str(ROOT / 'certs')}
     return protocol, port, cert
@@ -105,6 +108,17 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
+def backend_diagnostics(payload, stage):
+    print('\n── 后端服务状态与日志（'+stage+'）──', flush=True)
+    try:
+        state = command('systemctl', 'is-active', 'xboard-node.service', check=False).stdout.strip()
+        print('后端服务状态：'+(state or 'unknown'), flush=True)
+        journal = command('journalctl', '-u', 'xboard-node.service', '-n', '60', '--no-pager', '-o', 'short-iso', check=False).stdout
+        print((journal or '暂无后端日志').replace(payload['token'], '[REDACTED]')[-12000:], flush=True)
+    except Exception:
+        print('无法读取后端日志，请使用面板“查看后端日志”重试。', flush=True)
+
+
 def deploy(payload):
     if os.geteuid() != 0 or not Path('/run/systemd/system').is_dir():
         raise ValueError('自动部署需要支持 systemd 的 root Linux 服务器')
@@ -119,6 +133,9 @@ def deploy(payload):
         if len(data) > 4 * 1024 * 1024:
             raise ValueError('wp2 节点配置响应过大')
         config = json.loads(data)
+    if payload.get('dns_wait') and payload.get('connection_domain'):
+        print('验证连接域名 %s → %s' % (payload['connection_domain'], payload['ip']), flush=True)
+        wait_node_dns(payload['connection_domain'], payload['ip'], payload.get('ipv6', ''), True)
     protocol, port, cert = node_settings(config, payload['ip'], payload.get('ipv6', ''), payload.get('dns_wait', False))
     print('节点配置验证通过，协议：%s，端口：%s，证书模式：%s' % (protocol, port, cert['cert_mode']), flush=True)
     binding = {'panel': payload['panel'], 'node_id': payload['node_id']}
@@ -215,10 +232,12 @@ WantedBy=multi-user.target
                 if cert['cert_mode'] == 'http':
                     print('ACME 证书已签发；内置 CertMagic 自动续期并重新加载，无需另配 cron。', flush=True)
                 print('节点客户端仍需能连接此 IP/域名；云防火墙与外部网络连通性不由本机健康检查证明。', flush=True)
+                backend_diagnostics(payload, '安装完成')
                 return
             time.sleep(1)
         raise ValueError('服务或证书验证超时，请检查 DNS、80 端口、节点端口和 wp2 配置')
     except Exception:
+        backend_diagnostics(payload, '部署失败，回滚前')
         if mutated:
             command('systemctl', 'stop', 'xboard-node.service', check=False)
             for path in paths:

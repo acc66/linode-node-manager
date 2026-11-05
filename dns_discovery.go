@@ -14,6 +14,13 @@ import (
 )
 
 func (s *Server) wp2NodeDomain(ctx context.Context, base, token string, target int) (string, error) {
+	session, sessionErr := s.loadWP2Session()
+	if sessionErr != nil {
+		return "", sessionErr
+	}
+	if session != nil {
+		return s.adminWP2Connection(ctx, session, target)
+	}
 	request, err := http.NewRequestWithContext(ctx, "GET", strings.TrimRight(base, "/")+fmt.Sprintf("/api/v1/server/UniProxy/config?node_id=%d", target), nil)
 	if err != nil {
 		return "", errors.New("wp2 节点配置地址无效")
@@ -31,6 +38,10 @@ func (s *Server) wp2NodeDomain(ctx context.Context, base, token string, target i
 		return "", fmt.Errorf("读取 wp2 节点配置 HTTP %d", resp.StatusCode)
 	}
 	var config struct {
+		Server      string `json:"server"`
+		Address     string `json:"server_address"`
+		ServerType  string `json:"server_type"`
+		Network     string `json:"network"`
 		Domain      string `json:"domain"`
 		ServerName  string `json:"server_name"`
 		TLSSettings struct {
@@ -40,6 +51,16 @@ func (s *Server) wp2NodeDomain(ctx context.Context, base, token string, target i
 	if json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&config) != nil {
 		return "", errors.New("wp2 节点配置格式无效")
 	}
+	if config.Server != "" {
+		return wp2ConnectionAddress(config.Server)
+	}
+	if config.Address != "" {
+		return wp2ConnectionAddress(config.Address)
+	}
+	if config.ServerType != "" || config.Network != "" {
+		return s.legacyWP2Connection(ctx, base, token, target)
+	}
+	// Compatibility with simple discovery responses that explicitly expose a domain.
 	domain := config.TLSSettings.ServerName
 	if domain == "" {
 		domain = config.ServerName

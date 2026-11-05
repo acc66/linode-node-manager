@@ -164,7 +164,7 @@ func (s *Server) syncAliDNS(ctx context.Context, config DNSConfig, domain, ipv4,
 	}
 	return nil
 }
-func (s *Server) prepareDeploymentDNS(ctx context.Context, base, token string, target int, instance Instance) (bool, string, error) {
+func (s *Server) prepareDeploymentDNS(ctx context.Context, base, token string, target int, instance *Instance) (bool, string, error) {
 	configs, err := s.dnsConfigs()
 	if err != nil {
 		return false, "", err
@@ -176,36 +176,42 @@ func (s *Server) prepareDeploymentDNS(ctx context.Context, base, token string, t
 		}
 	}
 	if !active {
-		return false, "", nil
+		return false, "自动 DNS 未启用，未修改 DNS 记录。\n", nil
 	}
 	domain, err := s.wp2NodeDomain(ctx, base, token, target)
 	if err != nil {
 		return false, "", err
 	}
 	if domain == "" || net.ParseIP(domain) != nil {
-		return false, "未识别到可自动解析的节点域名，交由节点安装检查。\n", nil
+		return false, fmt.Sprintf("节点连接地址：%s（IP 地址），无需自动 DNS。\n", domain), nil
 	}
 	domain, err = normalizeZone(domain)
 	if err != nil {
 		return false, "", err
 	}
+	ipv4 := publicIP(*instance)
+	ipv6 := strings.Split(instance.IPv6, "/")[0]
+	ipv6Display := ipv6
+	if ipv6Display == "" {
+		ipv6Display = "无 IPv6，将清理旧 AAAA"
+	}
+	instance.DNSDomain = domain
+	prefix := fmt.Sprintf("DNS 连接域名：%s\nDNS 目标 IPv4：%s\nDNS 目标 IPv6：%s\n", domain, ipv4, ipv6Display)
 	provider, err := s.dnsConfigFor(domain)
 	if err != nil {
 		return false, "", err
 	}
 	if provider == nil {
-		return false, "节点域名没有匹配的已启用 DNS 配置，将检查现有解析。\n", nil
+		return false, prefix, fmt.Errorf("连接域名 %s 没有匹配的已启用 DNS 配置，DNS 未同步，已停止安装", domain)
 	}
 	panelURL, _ := url.Parse(base)
 	if domain == provider.Zone || domain == strings.ToLower(panelURL.Hostname()) || domain == strings.ToLower(env("PANEL_DOMAIN", "")) {
-		return false, "", errors.New("自动 DNS 不修改根域名、wp2 地址或管理面板域名；请为节点配置独立子域名")
+		return false, prefix, errors.New("自动 DNS 不修改根域名、wp2 地址或管理面板域名；请为节点配置独立子域名")
 	}
-	ipv4 := publicIP(instance)
-	ipv6 := strings.Split(instance.IPv6, "/")[0]
 	if ipv6 != "" {
 		parsed := net.ParseIP(ipv6)
 		if parsed == nil || parsed.To4() != nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() {
-			return false, "", errors.New("实例 IPv6 格式无效，未修改 DNS")
+			return false, prefix, errors.New("实例 IPv6 格式无效，未修改 DNS")
 		}
 	}
 	if provider.Provider == "cloudflare" {
@@ -216,9 +222,9 @@ func (s *Server) prepareDeploymentDNS(ctx context.Context, base, token string, t
 		err = errors.New("不支持的 DNS 服务商")
 	}
 	if err != nil {
-		return false, "", fmt.Errorf("自动 DNS 未完成，记录可能已部分更新：%w", err)
+		return false, prefix, fmt.Errorf("自动 DNS 未完成，记录可能已部分更新：%w", err)
 	}
-	return true, fmt.Sprintf("自动 DNS 已更新 %s（%s）：A=%s，AAAA=%s；等待解析生效。\n", domain, provider.Provider, ipv4, func() string {
+	return true, prefix + fmt.Sprintf("自动 DNS 已更新 %s（%s）：A=%s，AAAA=%s；等待解析生效。\n", domain, provider.Provider, ipv4, func() string {
 		if ipv6 == "" {
 			return "无 IPv6，已清理旧 AAAA"
 		}

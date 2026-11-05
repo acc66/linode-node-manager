@@ -46,6 +46,7 @@ type Snapshot struct {
  Updated string `json:"updated_at"`
 }
 type Job struct {
+ DNSStatus string `json:"dns_status,omitempty"`
  InstanceID int `json:"instance_id,omitempty"`
  TargetID int `json:"target_id,omitempty"`
  AccountID string `json:"account_id,omitempty"`
@@ -54,6 +55,7 @@ type Job struct {
  Log string `json:"log"`
 }
 type Instance struct {
+ DNSDomain string `json:"-"`
  AccountID string `json:"account_id,omitempty"`
  ID int `json:"id"`
  Label string `json:"label"`
@@ -217,7 +219,7 @@ func (s *Server) monitoring(ctx context.Context){
  s.poll(ctx);s.pollAccounts(ctx);for{select{case <-ctx.Done():return;case <-ticker.C:s.poll(ctx);s.pollAccounts(ctx)}}
 }
 func (s *Server) install(w http.ResponseWriter,r *http.Request){
- accountID:=r.URL.Query().Get("account_id")
+ accountID:=r.URL.Query().Get("account_id");if accountID==""{accountID="legacy"}
  if _,err:=s.accountToken(accountID);err!=nil{fail(w,400,"Unknown or unconfigured Linode account");return}
  var in struct{InstanceID int `json:"instance_id"`;Mode string `json:"mode"`;TargetID int `json:"target_id"`}
  if json.NewDecoder(io.LimitReader(r.Body,1<<16)).Decode(&in)!=nil||in.InstanceID<=0||in.TargetID<=0||in.Mode!="node"{fail(w,400,"Valid instance_id, node mode and target_id required");return}
@@ -232,23 +234,28 @@ func (s *Server) install(w http.ResponseWriter,r *http.Request){
  go func(){
   s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,InstanceID:in.InstanceID,TargetID:in.TargetID,Status:"running"};s.mu.Unlock()
   ctx,cancel:=context.WithTimeout(context.Background(),30*time.Minute);defer cancel()
-  dnsReady,prefix,err:=s.prepareDeploymentDNS(ctx,base,token,in.TargetID,inst)
+  dnsReady,prefix,err:=s.prepareDeploymentDNS(ctx,base,token,in.TargetID,&inst)
+  dnsStatus:="skipped";if dnsReady{dnsStatus="updated"};if err!=nil{dnsStatus="failed"}
   output:=prefix
   if err==nil{
-   s.mu.Lock();current:=s.jobs[id];current.Log=prefix;s.jobs[id]=current;s.mu.Unlock()
+   s.mu.Lock();current:=s.jobs[id];current.Log=prefix;current.DNSStatus=dnsStatus;s.jobs[id]=current;s.mu.Unlock()
    script:=deploymentScript(base,token,in.TargetID,inst,dnsReady)
-   var remote string;remote,err=s.deploySSH(ctx,accountID,inst,script);output+=remote
+   var remote string;remote,err=s.deploySSH(ctx,accountID,inst,script,func(progress string){
+    text:=prefix+progress;if len(text)>16000{text=text[len(text)-16000:]}
+    s.mu.Lock();current:=s.jobs[id];current.Log=text;current.DNSStatus=dnsStatus;s.jobs[id]=current;s.mu.Unlock()
+   });output+=remote
   }
   output=strings.ReplaceAll(output,token,"[REDACTED]")
-  if len(output)>12000{output=output[len(output)-12000:]}
+  if len(output)>16000{output=output[len(output)-16000:]}
   state:="success";if err!=nil{state="failed";output+="\nInstallation failed: "+err.Error();if dnsReady{output+="\nDNS 记录已更新并保留，可修复问题后重新安装。"}}
-  s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,InstanceID:in.InstanceID,TargetID:in.TargetID,Status:state,Log:output};s.mu.Unlock()
+  s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,InstanceID:in.InstanceID,TargetID:in.TargetID,Status:state,Log:output,DNSStatus:dnsStatus};s.mu.Unlock()
  }()
  send(w,202,map[string]string{"job_id":id,"status":"queued"})
 }
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func newHandler(s *Server) http.Handler {
  mux:=http.NewServeMux()
+ mux.HandleFunc("GET /api/instances/{id}/backend/logs",s.auth(s.backendLogsAPI))
  mux.HandleFunc("POST /api/dns/discover",s.auth(s.dnsDiscoverAPI))
  mux.HandleFunc("GET /api/telegram/settings",s.auth(s.telegramSettingsAPI))
  mux.HandleFunc("POST /api/telegram/settings",s.auth(s.telegramSettingsAPI))
@@ -340,7 +347,7 @@ const htmlPage = `<!doctype html>
 <section id="servers"><div class="section-header"><div><h2>服务器实例</h2><p id="msg" class="message">正在加载服务器…</p></div><button onclick="load()">↻ 刷新</button></div><div id="instances" class="table-wrap"></div></section>
 <section id="create"><div class="section-header"><div><h2>创建 Linode</h2><p>选择套餐与地区，确认费用后创建</p></div><span class="tag">新实例</span></div><div class="toolbar" style="margin-bottom:16px"><button onclick="catalogs()">加载地区、套餐和系统</button><span class="desktop-note">选项来自当前 Linode 账号</span></div><div class="grid"><label>服务器名称<input id="createlabel" placeholder="例如：jp-node-01" maxlength="64"></label><label>地区<select id="createregion"><option value="">请先加载选项</option></select></label><label>套餐<select id="createtype"><option value="">请先加载选项</option></select></label><label>系统镜像<select id="createimage"><option value="">请先加载选项</option></select></label><label class="span-all">Root 密码<input id="createpass" type="password" autocomplete="new-password" placeholder="至少 12 位，创建后加密保存"></label></div><div class="action-row"><label class="check"><input id="openallports" type="checkbox" checked>新实例默认放行全部端口</label><button class="primary" id="createbutton" onclick="createInstance()">创建并开机</button></div><p id="createmsg" class="message"></p></section>
 <section id="wp2"><div class="section-header"><div><h2>wp2 节点</h2><p>连接管理员账号，同步全部节点</p></div><button onclick="nodes()">↻ 同步节点</button></div><p id="wp2connection" class="message"></p><details class="subpanel"><summary>连接或更换 wp2 账号</summary><div class="grid"><label>管理员邮箱<input id="wp2email" type="email" autocomplete="username" placeholder="admin@example.com"></label><label>管理员密码<input id="wp2password" type="password" autocomplete="off" placeholder="密码仅用于本次登录"></label><label class="span-all">两步动态码（如启用）<input id="wp2code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位动态码"></label></div><div class="toolbar" style="margin-top:14px"><button class="primary" id="wp2connect" onclick="connectWP2()">连接 wp2</button><button class="danger" onclick="disconnectWP2()">断开连接</button></div><p class="hint">登录会话加密保存在管理机，密码不保存。</p></details><p id="nodehint" class="message">正在加载节点…</p><details class="reveal"><summary>浏览节点列表 · 搜索 / 分页</summary><input id="nodesearch" placeholder="搜索节点名称或 ID" aria-label="搜索节点" oninput="nodePage=0;renderNodes()"><div id="nodes" style="margin-top:12px"></div><div class="pagination"><button id="nodesprev" onclick="nodePage--;renderNodes()">上一页</button><span id="nodespage"></span><button id="nodesnext" onclick="nodePage++;renderNodes()">下一页</button></div></details></section>
-<section id="deploy"><div class="section-header"><div><h2>自动安装后端</h2><p>选择实例和节点，自动检查配置、证书与服务</p></div><span class="tag">XboardNode-Plus</span></div><p id="installaccount" class="message">请先选择 Linode 账号</p><div class="grid" style="margin-top:14px"><label><span><span class="step-number">1</span>安装到哪台服务器</span><select id="instance" onchange="updateDNSTarget()"><option value="">请先选择账号并加载服务器</option></select></label><label><span><span class="step-number">2</span>绑定哪个 wp2 节点</span><select id="node" onchange="updateDNSTarget()"><option value="">请先同步 wp2 节点</option></select></label></div><div class="action-row"><span class="desktop-note">DNS 自动解析按下方启用的域名配置匹配</span><button class="primary" id="installbutton" onclick="install()">自动安装并验证</button></div><pre id="joblog" aria-live="polite"></pre><details class="subpanel"><summary>查询历史任务</summary><div class="toolbar"><input id="job" placeholder="任务 ID" aria-label="任务 ID"><button onclick="job()">查询任务</button></div></details></section>
+<section id="deploy"><div class="section-header"><div><h2>自动安装后端</h2><p>选择实例和节点，自动检查配置、证书与服务</p></div><span class="tag">XboardNode-Plus</span></div><p id="installaccount" class="message">请先选择 Linode 账号</p><div class="grid" style="margin-top:14px"><label><span><span class="step-number">1</span>安装到哪台服务器</span><select id="instance" onchange="updateDNSTarget()"><option value="">请先选择账号并加载服务器</option></select></label><label><span><span class="step-number">2</span>绑定哪个 wp2 节点</span><select id="node" onchange="updateDNSTarget()"><option value="">请先同步 wp2 节点</option></select></label></div><div class="action-row"><span class="desktop-note">DNS 自动解析按下方启用的域名配置匹配</span><div class="toolbar"><button onclick="backendLogs()" id="backendlogbutton">查看后端日志</button><button class="primary" id="installbutton" onclick="install()">自动安装并验证</button></div></div><pre id="joblog" aria-live="polite"></pre><details class="subpanel"><summary>查询历史任务</summary><div class="toolbar"><input id="job" placeholder="任务 ID" aria-label="任务 ID"><button onclick="job()">查询任务</button></div></details></section>
 <section id="dns"><div class="section-header"><div><h2>DNS 自动解析与证书</h2><p>配置一次密钥，安装时按节点域名自动匹配</p></div><span class="tag">加密保存</span></div><p id="dnstarget" class="message">请选择安装目标服务器，DNS 将指向该实例公网 IP。</p><div id="dnsconfigs"></div><p id="dnsmsg" class="message"></p><details class="subpanel"><summary>添加 DNS 域名与密钥</summary><div class="grid"><label>DNS 服务商<select id="dnsprovider" onchange="dnsFields()"><option value="cloudflare">Cloudflare</option><option value="alidns">阿里云 DNS</option></select></label><label>托管域名<input id="dnszone" placeholder="填写 Key 后可自动读取，或手动填写"></label><div class="span-all"><div class="toolbar"><button id="dnsdiscover" onclick="discoverDNS()">读取托管域名并匹配节点</button><select id="dnszones" aria-label="已读取的托管域名" onchange="document.getElementById('dnszone').value=this.value"><option value="">先填写 Key，再读取域名</option></select></div></div><span id="cfkeyfields" class="span-all"><label>Cloudflare API Token<input id="dnstoken" type="password" autocomplete="off" placeholder="需要 Zone Read / DNS Edit 权限"></label></span><span id="alikeyfields" class="span-all" hidden><label>阿里云 AccessKey ID<input id="dnsaccessid" type="password" autocomplete="off" placeholder="RAM AccessKey ID"></label><label>阿里云 AccessKey Secret<input id="dnssecret" type="password" autocomplete="off" placeholder="RAM AccessKey Secret"></label></span></div><div class="action-row"><label class="check"><input id="dnsenabled" type="checkbox" checked>安装时自动更新 DNS</label><button class="primary" onclick="saveDNS()">加密保存 DNS 配置</button></div><p class="hint">只更新节点子域名 A/AAAA；Cloudflare 使用灰云。根域名、面板地址和 CNAME 不自动修改。</p></details></section>
 <section id="telegram"><div class="section-header"><div><h2>Telegram 提醒</h2><p>直接配置机器人，接收监控异常与恢复通知</p></div><span class="tag">消息通知</span></div><p id="tgstatus" class="message"></p><details class="subpanel"><summary>设置机器人与接收聊天</summary><div class="grid"><label>Bot Token<input id="tgtoken" type="password" autocomplete="off" placeholder="由 BotFather 获取；留空保留已保存 Token"></label><label>Chat ID<input id="tgchat" placeholder="个人 ID、群组负数 ID 或 @频道用户名"></label></div><div class="action-row"><label class="check"><input id="tgenabled" type="checkbox" checked>启用 Telegram 提醒</label><button class="primary" onclick="saveTelegram()">加密保存</button></div><p class="hint">个人聊天请先向机器人发送 /start；群组或频道需允许机器人发消息。告警依赖资源监控运行。</p></details><div class="toolbar" style="margin-top:14px"><button id="tgtest" onclick="testTelegram()">发送测试消息</button><button class="danger" onclick="removeTelegram()">移除网页配置</button></div><p id="tgmsg" class="message"></p></section><section id="monitor"><div class="section-header"><div><h2>资源监控</h2><p>CPU / 内存 / 磁盘 · 数据来自 SSH 监控</p></div><button onclick="monitor()">↻ 刷新</button></div><pre id="metrics"></pre></section>
 <p class="footnote">Linode Node Manager · 通过 HTTPS 访问 · 凭据加密存储</p>
@@ -355,7 +362,7 @@ const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&g
  if(!account.value){show('joblog','请先选择目标 Linode 账号');return}
  if(installationAccount!==account.value||!Number.isInteger(Number(instance.value))||Number(instance.value)<=0){show('joblog','请选择该账号下运行中的 Linode 服务器');return}
  if(!node.value){show('joblog','请先同步并选择 wp2 节点');return}
- if(!confirm('确认自动安装后端？\nLinode 账号：'+accountLabel(account.value)+'\n服务器：'+instance.selectedOptions[0].textContent+'\nwp2 节点：'+node.selectedOptions[0].textContent+'\n将自动检查配置、申请证书并启用服务。如匹配已启用的 DNS 配置，会更新该节点子域名 A/AAAA、移除无对应 IPv6 的旧 AAAA，Cloudflare 改为灰云。'))return;
+ if(!confirm('确认自动安装后端？\nLinode 账号：'+accountLabel(account.value)+'\n服务器：'+instance.selectedOptions[0].textContent+'\nwp2 节点：'+node.selectedOptions[0].textContent+'\n将自动检查配置、申请证书并启用服务；再次安装会重启后端。如匹配已启用的 DNS 配置，会更新该节点子域名 A/AAAA、移除无对应 IPv6 的旧 AAAA，Cloudflare 改为灰云。'))return;
  button.disabled=true;
  try{const result=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(instance.value),mode:'node',target_id:Number(node.value)})});document.getElementById('job').value=result.job_id;show('joblog',result);watchJob(result.job_id)}catch(e){button.disabled=false;show('joblog',e.message)}
 }
@@ -441,7 +448,7 @@ async function saveProxy(){const input=document.getElementById('proxyurl');try{i
 async function removeProxy(){try{await api('/linode/proxy',{method:'DELETE'});document.getElementById('useproxy').checked=false;await proxyStatus()}catch(e){document.getElementById('proxystatus').textContent=e.message}}
 
 let watchedJob='';
-async function watchJob(id){watchedJob=id;const button=document.getElementById('installbutton');button.disabled=true;try{while(watchedJob===id){const result=await api('/deployments/'+encodeURIComponent(id));show('joblog',result);if(result.status==='success'||result.status==='failed')break;await new Promise(resolve=>setTimeout(resolve,2500))}}catch(e){show('joblog',e.message)}finally{if(watchedJob===id){watchedJob='';button.disabled=false}}}
+async function watchJob(id){watchedJob=id;const button=document.getElementById('installbutton');button.disabled=true;try{while(watchedJob===id){const result=await api('/deployments/'+encodeURIComponent(id));show('joblog',result);if(result.status==='success'||result.status==='failed'){if(result.status==='success')button.textContent='重新安装（会重启后端）';break;}await new Promise(resolve=>setTimeout(resolve,2500))}}catch(e){show('joblog',e.message)}finally{if(watchedJob===id){watchedJob='';button.disabled=false}}}
 
 let nodeCache=[],nodePage=0;
 function renderNodes(){
@@ -463,4 +470,6 @@ async function removeTelegram(){if(!confirm('移除网页保存的 Telegram 配�
 
 function updateDNSTarget(){const instance=installationTargets.find(x=>String(x.id)===document.getElementById('instance').value&&x.account_id===document.getElementById('account').value);document.getElementById('dnstarget').textContent=instance?'DNS 解析目标：'+instance.label+' (#'+instance.id+') · A → '+(instance.ipv4||[]).join(', ')+(instance.ipv6?' · AAAA → '+instance.ipv6.split('/')[0]:' · 无 IPv6 时清理旧 AAAA'):'请选择安装目标服务器，DNS 将指向该实例公网 IP，而不是管理机 IP。'}
 async function discoverDNS(){const button=document.getElementById('dnsdiscover'),message=document.getElementById('dnsmsg');if(button.disabled)return;button.disabled=true;message.textContent='正在读取托管域名并匹配当前 wp2 节点…';try{const result=await api('/dns/discover',{method:'POST',body:JSON.stringify({provider:document.getElementById('dnsprovider').value,token:document.getElementById('dnstoken').value,access_key_id:document.getElementById('dnsaccessid').value,access_key_secret:document.getElementById('dnssecret').value,node_id:Number(document.getElementById('node').value)||0})});const select=document.getElementById('dnszones');select.replaceChildren();const empty=document.createElement('option');empty.value='';empty.textContent='选择托管域名';select.appendChild(empty);for(const zone of result.zones){const option=document.createElement('option');option.value=zone;option.textContent=zone;select.appendChild(option)}select.value=result.suggested_zone||'';document.getElementById('dnszone').value=result.suggested_zone||'';message.textContent=result.message||'读取到 '+result.zones.length+' 个托管域名。'+(result.suggested_zone?'已自动选择 '+result.suggested_zone+'，保存后安装时解析到所选实例 IP。':'请选择正确域名后保存。')}catch(e){message.textContent=e.message}finally{button.disabled=false}}
+
+async function backendLogs(){const account=document.getElementById('account').value,id=Number(document.getElementById('instance').value),button=document.getElementById('backendlogbutton');if(!account||!Number.isInteger(id)||id<=0){show('joblog','请先选择具体账号和服务器');return}if(button.disabled)return;button.disabled=true;try{const result=await api('/instances/'+id+'/backend/logs');document.getElementById('joblog').textContent='后端服务状态：'+result.service+'\n'+result.log}catch(e){show('joblog',e.message)}finally{button.disabled=false}}
 async function initialize(){await loadAccounts();await Promise.all([load(),nodes(),monitor(),wp2Connection(),proxyStatus(),loadDNS(),loadTelegram()])}initialize();setInterval(()=>monitor(),30000)</script></html>`

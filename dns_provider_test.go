@@ -168,7 +168,7 @@ func TestDNSInstallProtectsRootAndPanelDomains(t *testing.T) {
 	for _, name := range []string{"example.com", "wp2.example.com", "panel.example.com"} {
 		domain = name
 		t.Setenv("PANEL_DOMAIN", "panel.example.com")
-		if _, _, err := s.prepareDeploymentDNS(context.Background(), "https://wp2.example.com", "wp2-token", 929, Instance{IPv4: []string{"172.104.46.26"}}); err == nil {
+		if _, _, err := s.prepareDeploymentDNS(context.Background(), "https://wp2.example.com", "wp2-token", 929, &Instance{IPv4: []string{"172.104.46.26"}}); err == nil {
 			t.Errorf("protected name allowed: %s", name)
 		}
 	}

@@ -129,5 +129,4 @@ def register(app,auth,linode):
   if RUNNING:
    RUNNING.cancel()
    with suppress(asyncio.CancelledError):await RUNNING
- app.add_event_handler("startup",start)
- app.add_event_handler("shutdown",stop)
+ return start,stop

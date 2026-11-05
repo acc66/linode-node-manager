@@ -43,3 +43,23 @@ jobs:
           done
           echo "Compose panel health check failed"
           exit 1
+      - name: HTTPS public login smoke test
+        shell: bash
+        run: |
+          cat >> .env <<'EOF'
+          ADMIN_USERNAME=ci-operator
+          ADMIN_PASSWORD=ci-test-password-long-enough
+          PANEL_DOMAIN=localhost
+          EOF
+          docker compose --profile public up -d --build
+          trap 'docker compose --profile public logs --tail=100 caddy manager; docker compose --profile public down -v' EXIT
+          for i in $(seq 1 40); do
+            status=$(curl -ksS -o /dev/null -w '%{http_code}' https://localhost/api/health || true)
+            if [ "$status" = "401" ]; then break; fi
+            sleep 1
+          done
+          test "$status" = "401"
+          curl -ksS -u ci-operator:ci-test-password-long-enough https://localhost/api/health | grep -q '"status":"ok"'
+          bad=$(curl -ksS -o /dev/null -w '%{http_code}' -u ci-operator:wrong-password https://localhost/api/health)
+          test "$bad" = "401"
+          echo "Public HTTPS and browser password authentication passed"

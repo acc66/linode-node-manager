@@ -63,7 +63,8 @@ func (s *Server) request(ctx context.Context,method,endpoint,token string,payloa
 }
 func (s *Server) linode(ctx context.Context,method,path string,payload io.Reader)([]byte,int,error){
  token:=os.Getenv("LINODE_TOKEN");if token==""{return nil,503,errors.New("LINODE_TOKEN not configured")}
- return s.request(ctx,method,"https://api.linode.com/v4"+path,token,payload)
+ base:=env("LINODE_API_BASE_URL","https://api.linode.com/v4")
+ return s.request(ctx,method,strings.TrimRight(base,"/")+path,token,payload)
 }
 func (s *Server) instances(ctx context.Context)([]Instance,error){
  out:=[]Instance{}

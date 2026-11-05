@@ -1,0 +1,13 @@
+.git
+.github
+.env
+.env.*
+!.env.example
+secrets
+secrets/**
+*.pem
+*.key
+*.db
+*.sqlite*
+linode-node-manager
+*.log

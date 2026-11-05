@@ -8,5 +8,23 @@ services:
     volumes:
       - manager-data:/data
       - ./secrets:/run/secrets:ro
+  caddy:
+    image: caddy:2-alpine
+    profiles: ["public"]
+    restart: unless-stopped
+    depends_on:
+      - manager
+    environment:
+      PANEL_DOMAIN: ${PANEL_DOMAIN:-localhost}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
 volumes:
   manager-data:
+  caddy-data:
+  caddy-config:

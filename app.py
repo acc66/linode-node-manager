@@ -22,11 +22,16 @@ def db():
 async def lifespan(app):
     c=db()
     c.close()
-    yield
+    await monitor_start()
+    try:
+        yield
+    finally:
+        await monitor_stop()
 
 app=FastAPI(title="Linode Node Manager",lifespan=lifespan)
 from deploy import register as register_deployments
 from wp2 import register as register_wp2
+from monitor import register as register_monitor
 
 def auth(authorization:str=Header(default="")):
     if not TOKEN or not secrets.compare_digest(authorization,"Bearer "+TOKEN):
@@ -46,6 +51,7 @@ async def linode(method,path,payload=None):
 
 register_deployments(app,auth,linode)
 register_wp2(app,auth)
+monitor_start,monitor_stop=register_monitor(app,auth,linode)
 
 class Create(BaseModel):
     label:str=Field(min_length=3,max_length=64,pattern=r"^[a-zA-Z0-9-]+$")
@@ -118,7 +124,7 @@ async def home():
 <h1>Linode 云服务器管理</h1><p>独立控制台 · 实例创建 / 状态 / 操作</p>
 <div class="card"><label>管理令牌 <input type="password" id="token" placeholder="ADMIN_TOKEN"></label><button onclick="load()">连接并刷新</button><p id="msg"></p></div>
 <div class="card"><h2>创建实例</h2><input id="label" placeholder="实例名称"><input id="region" placeholder="区域，例如 ap-south"><input id="type" placeholder="套餐，例如 g6-nanode-1"><input id="key" placeholder="SSH 公钥"><button onclick="create()">创建（会产生费用）</button><small>请先核实 Linode 套餐价格和区域。</small></div>
-<div class="card"><h2>wp2 节点及一键安装</h2><p><small>wp2 节点列表接口需在服务端配置 WP2_NODES_PATH；不在浏览器保存 API Token。</small></p><button onclick="nodes()">获取 wp2 节点</button><div id="nodes"></div><input id="did" type="number" placeholder="Linode 实例 ID"><select id="mode"><option value="node">节点模式</option><option value="machine">机器模式</option></select><input id="tid" type="number" placeholder="节点 / 机器 ID"><button onclick="install()">安装 XboardNode-Plus</button><input id="job" placeholder="任务 ID"><button onclick="checkjob()">查询安装日志</button><pre id="log" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></div><div class="card"><h2>服务器列表</h2><div id="list">请先输入管理令牌</div></div>
+<div class="card"><h2>wp2 节点及一键安装</h2><p><small>wp2 节点列表接口需在服务端配置 WP2_NODES_PATH；不在浏览器保存 API Token。</small></p><button onclick="nodes()">获取 wp2 节点</button><div id="nodes"></div><input id="did" type="number" placeholder="Linode 实例 ID"><select id="mode"><option value="node">节点模式</option><option value="machine">机器模式</option></select><input id="tid" type="number" placeholder="节点 / 机器 ID"><button onclick="install()">安装 XboardNode-Plus</button><input id="job" placeholder="任务 ID"><button onclick="checkjob()">查询安装日志</button><pre id="log" style="white-space:pre-wrap;overflow-wrap:anywhere"></pre></div><div class="card"><h2>服务器监控</h2><button onclick="monitor()">刷新监控</button><pre id="monitor" style="white-space:pre-wrap"></pre></div><div class="card"><h2>服务器列表</h2><div id="list">请先输入管理令牌</div></div>
 <script>
 function hdr(){return {'Authorization':'Bearer '+document.getElementById('token').value,'Content-Type':'application/json'}}
 async function req(path,opts={}){let r=await fetch('/api'+path,{...opts,headers:hdr()});let j=await r.json().catch(()=>({}));if(!r.ok)throw Error(JSON.stringify(j));return j}
@@ -130,5 +136,7 @@ async function del(id){if(prompt('输入实例 ID '+id+' 确认永久删除')!==
 async function create(){if(!confirm('确认创建付费 Linode 实例？'))return;try{let x=await req('/instances',{method:'POST',body:JSON.stringify({label:document.getElementById('label').value,region:document.getElementById('region').value,type:document.getElementById('type').value,authorized_keys:[document.getElementById('key').value],confirm_billable:true})});msg('创建成功，实例 ID '+x.id);await load()}catch(e){msg(e.message)}}
 async function nodes(){try{let d=await req("/wp2/nodes");document.getElementById("nodes").textContent=JSON.stringify(d,null,2)}catch(e){msg(e.message)}}
 async function install(){if(!confirm("确认在选中服务器安装或重配 XboardNode-Plus？"))return;try{let d=await req("/deployments/install",{method:"POST",body:JSON.stringify({instance_id:Number(document.getElementById("did").value),mode:document.getElementById("mode").value,target_id:Number(document.getElementById("tid").value)})});document.getElementById("job").value=d.job_id;msg("任务已提交 "+d.job_id)}catch(e){msg(e.message)}}
+async function monitor(){try{let d=await req("/monitor");document.getElementById("monitor").textContent=JSON.stringify(d.instances,null,2)}catch(e){msg(e.message)}}
+setInterval(()=>{if(document.getElementById("token").value)monitor()},30000);
 async function checkjob(){try{let d=await req("/deployments/"+encodeURIComponent(document.getElementById("job").value));document.getElementById("log").textContent=d.status+"\\n"+d.log}catch(e){msg(e.message)}}
 </script></html>"""

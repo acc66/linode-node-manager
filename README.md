@@ -1,55 +1,40 @@
-# Linode Node Manager
+# Linode Node Manager — Go
 
-独立的 Linode API 云服务器管理网站（MVP）。
+独立的 Go 1.22+ Linode 运维面板。主程序：`main.go`，不再使用 Python FastAPI。当前版本为 Go MVP，未完成真实 Linode/SSH/TG 联调。
 
-## 功能
-- 列出实例及其 IP、状态
-- 创建付费 Linode 实例（需要显式确认）
-- 开机、关机、重启、删除实例
-- 使用管理员 Bearer Token 保护 API
-- Docker Compose 部署，默认仅监听本机端口
+## 已实现
+- Linode 实例列表、开机、关机、重启（Linode v4 API）
+- wp2 的 `GET /mod_mu/nodes?key=...` 节点列表（仅输出 id/name/sort/status）
+- 通过严格 SSH 主机密钥验证运行 XboardNode-Plus 安装脚本（node 模式）
+- SSH 获取 CPU、内存、磁盘、uptime 和 systemd 服务状态
+- Telegram 离线、恢复、资源异常及服务异常通知
+- HTTP 管理接口需 `Authorization: Bearer ADMIN_TOKEN`
 
-> **注意：** wp2 API 对接、XboardNode-Plus 自动部署及节点在线监控尚未实现。不要将本项目直接暴露到公网；建议使用 HTTPS 反向代理、访问控制和限流。
+## 暂未移植 / 局限
+旧 Python 版的创建/删除实例、机器模式安装、SQLite 任务记录尚未移植；当前监控快照与安装任务保存在内存中，进程重启后丢失。监控轮询按实例顺序执行，不适合大规模服务器。没有历史图表或外部独立监控；管理服务器自身离线时无法发送告警。
 
-## 部署
+## Debian 12 / Docker
 ```bash
+git clone https://github.com/acc66/linode-node-manager.git
+cd linode-node-manager
 cp .env.example .env
-# 编辑 .env：设置 LINODE_TOKEN 和高强度 ADMIN_TOKEN
-chmod 600 .env
+nano .env
+mkdir -p secrets && chmod 700 secrets
+# 配置 secrets/linode_ssh_key (chmod 600) 和已核实主机指纹的 secrets/known_hosts
 docker compose up -d --build
+docker compose logs --tail=100 manager
 ```
+默认监听 `127.0.0.1:8000`，需要通过 HTTPS 反向代理或 SSH 隧道访问。不要将管理端口直接暴露公网。
 
-使用 SSH 隧道访问 `http://127.0.0.1:8000`，或配置受保护的 HTTPS 入口。
+必填：`ADMIN_TOKEN`、`LINODE_TOKEN`、`WP2_BASE_URL`、`WP2_API_TOKEN`。wp2 源码已确认 `/mod_mu/nodes` 使用查询参数 `key`，且可能受 `WebAPI` 与 `checkNodeIp` 配置限制。已在聊天中公开的密钥请轮换，不要提交到 GitHub。
 
-Linode API Token 需要具有实例管理权限；创建实例会产生费用，删除实例会永久销毁相关数据。
+可选：`MONITOR_ENABLED=true`、`MONITOR_INTERVAL=60`、`TG_BOT_TOKEN`、`TG_CHAT_ID`。
 
-## wp2 对接及在线安装（实验性）
-设置 `.env`：
-```ini
-WP2_BASE_URL=https://api10.seox9.com
-WP2_API_TOKEN=在服务器本地填写新生成的通信密钥
-WP2_NODES_PATH=
-WP2_AUTH_HEADER=Authorization
-WP2_AUTH_SCHEME=Bearer
-```
-**WP2_NODES_PATH 目前必须按 wp2 源码中实际节点列表 API 填写。** 由于私有 wp2 仓库路由尚未核实，暂不提供猜测的路径。部分 wp2 站点的后端通信 token 与后台管理 token 不同，必须验证权限与接口返回结构。
-
-安装到**已存在且运行中**的 Linode：面板会通过 SSH 连接实例公网 IP，运行 acc66/XboardNode-Plus 的 Linux 安装脚本，支持 node/machine 模式。请确保服务器系统、安装脚本版本和面板通信协议兼容。
-
-在管理服务器上创建 `secrets/` 目录，放入 `linode_ssh_key`（0600）及 `known_hosts`（已**通过可信渠道验证**的 SSH 主机指纹）；这些文件不会被提交到 GitHub。创建实例时使用与私钥对应的 SSH 公钥。默认 SSH 用户 root。Docker Compose 将只读挂载 secrets。
-
+## 直接编译
 ```bash
-mkdir -p secrets
-chmod 700 secrets
-# 安全地把 SSH 私钥放到 secrets/linode_ssh_key
-chmod 600 secrets/linode_ssh_key
-# 验证主机指纹后写入 secrets/known_hosts
-docker compose up -d --build
+go build -o linode-node-manager .
+./linode-node-manager
 ```
 
-注意：SSH 首次部署需要先验证主机指纹。当前安装任务仅保存在内存，重启管理容器后任务历史会丢失；不应将此 MVP 当作生产级任务队列。API Token 不会上传至公开仓库。若之前在聊天中公开过 Token，请先轮换。
-
-## 服务器资源监控与 Telegram 告警
-设置 `MONITOR_ENABLED=true` 后，后台每 60 秒通过已验证主机指纹的 SSH 采集 CPU、内存、磁盘、运行时间和 xboard-node 服务状态。网页通过「刷新监控」展示数据。配置 `TG_BOT_TOKEN` 与 `TG_CHAT_ID` 后，连续 3 次探测失败会触发离线告警，恢复时发送恢复通知。CPU/内存/磁盘达到阈值及后端服务异常会发送状态变化通知；暂未实现这些资源指标的连续多次阈值判断。
-
-注意：Linode 实例必须预装 Python 3，并允许使用配置的 SSH 密钥登录。未启用监控时不会发告警；监控服务器自身宕机时也无法发出通知，生产环境建议增加外部独立探测。当前仅保存最新状态，不提供历史曲线。
+## 测试
+GitHub Actions 执行 `go test ./...`、`go vet ./...`、`go build ./...` 和 Docker 构建。CI 提交不代表已通过；请查看 Actions 结果。

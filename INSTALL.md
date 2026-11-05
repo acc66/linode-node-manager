@@ -96,6 +96,28 @@ openssl rand -hex 24
 
 编辑 `.env` 时注意不要在键值两侧加空格；如果密码包含 `#`、`$`、空格等字符，Docker Compose 的解析/插值可能有特殊规则，建议使用 openssl 的十六进制随机字符串。
 
+## 4A. 添加多个 Linode 账号（推荐）
+
+新增的 **Linode 多账号管理** 可以在网页中保存多个账号的独立 API Token，并按账号查看实例、执行开关机或选择安装目标。
+
+1. 在管理机执行 `openssl rand -hex 32`，将生成的随机值**仅保存在服务器本地** `.env` 的 `ACCOUNT_ENCRYPTION_KEY`，不要发送到聊天或上传 GitHub。
+2. 确认 `.env` 中有：
+   ```dotenv
+   ACCOUNT_ENCRYPTION_KEY=请填入生成的64位随机值
+   ACCOUNTS_FILE=/data/accounts.enc
+   ```
+3. 重新启动容器：
+   ```bash
+   docker compose --profile public up -d --build --force-recreate
+   ```
+4. HTTPS 登录网页后，找到「Linode 多账号管理」，填写账号备注和对应的新 API Token，点击「添加账号」。
+5. 在下拉框选择某个账号，点击刷新后只显示该账号实例。**选择「全部账号」时只能查看，开关机和安装必须先选定账号**，避免相同 Linode 实例 ID 导致误操作。
+6. 删除网页中的账号只移除本地保存的凭据，不会删除任何 Linode 云服务器。
+
+保存位置：Docker 卷内的 `/data/accounts.enc`，采用 AES-GCM 加密存储，网页 API 不回传明文 Token。请同时备份 **加密文件及单独保存的加密密钥**，否则更换密钥后旧数据无法恢复。不要使用之前在聊天中公开过的 Token，建议每个账号授予最小权限。
+
+如果原来的 `LINODE_TOKEN` 仍保留在 `.env`，页面会出现一个「默认账号 (.env)」；不需要这个账号时可以清空该变量，多账号功能依然可用。服务器关闭或监控通知会标记对应账号，避免账号之间串号。
+
 ## 5. 配置 SSH 监控和安装（可选）
 
 ```bash

@@ -31,7 +31,7 @@ func TestMockLinodePowerAPI(t *testing.T) {
  t.Setenv("ADMIN_TOKEN","ci-admin")
  t.Setenv("LINODE_TOKEN","mock-linode-token")
  var calls atomic.Int32
- upstream:=httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+ upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
   if got:=r.Header.Get("Authorization");got!="Bearer mock-linode-token"{t.Errorf("wrong upstream authorization %q",got)}
   if r.Method!="POST"{t.Errorf("method %s",r.Method)}
   if !strings.HasPrefix(r.URL.Path,"/v4/linode/instances/77/"){t.Errorf("path %s",r.URL.Path)}
@@ -58,7 +58,7 @@ func TestMockLinodePowerAPI(t *testing.T) {
 func TestMockLinodeInstanceListing(t *testing.T) {
  t.Setenv("ADMIN_TOKEN","ci-admin")
  t.Setenv("LINODE_TOKEN","mock")
- upstream:=httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+ upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
   if r.URL.Path!="/v4/linode/instances"{t.Errorf("bad path %s",r.URL.Path)}
   switch r.URL.Query().Get("page"){
   case "1": _,_=w.Write([]byte(`{"pages":2,"data":[{"id":1,"label":"one","status":"running","ipv4":["8.8.8.8"]}]}`))
@@ -78,7 +78,7 @@ func TestMockWP2NodesAndDropdownData(t *testing.T) {
  t.Setenv("ADMIN_TOKEN","ci-admin")
  t.Setenv("WP2_API_TOKEN","mock-wp2-secret")
  t.Setenv("WP2_NODES_PATH","/mod_mu/nodes")
- upstream:=httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+ upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
   if r.URL.Path!="/mod_mu/nodes"||r.URL.Query().Get("key")!="mock-wp2-secret"{t.Errorf("bad wp2 request %s",r.URL.String())}
   _,_=w.Write([]byte(`{"ret":1,"data":[{"id":13,"name":"测试节点","sort":11,"passwd":"must-not-leak","server":"secret-url"},{"id":14,"name":"第二节点","sort":12}]}`))
  }))
@@ -101,7 +101,7 @@ func TestMockInstallTaskAndRedaction(t *testing.T) {
  t.Setenv("LINODE_TOKEN","mock")
  t.Setenv("WP2_API_TOKEN","mock-install-secret")
  t.Setenv("WP2_BASE_URL","https://wp2.invalid")
- upstream:=httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+ upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
   if r.URL.Path!="/v4/linode/instances/33"{t.Errorf("unexpected Linode lookup %s",r.URL.Path)}
   _,_=w.Write([]byte(`{"id":33,"label":"mock","status":"running","ipv4":["8.8.8.8"]}`))
  }))
@@ -125,7 +125,7 @@ func TestMockInstallTaskAndRedaction(t *testing.T) {
  if err:=json.Unmarshal(w.Body.Bytes(),&queued);err!=nil||queued.ID==""{t.Fatalf("bad job id: %v",err)}
  select {
  case script:=<-scripted:
-  if !strings.Contains(script,"--node-id 19")||!strings.Contains(script,"--mode node")||!strings.Contains(script,"--panel 'https://wp2.invalid'"){t.Fatalf("install script malformed")}
+  if !strings.Contains(script,"XN_AUTODEPLOY")||!strings.Contains(script,"CertMagic")||!strings.Contains(script,"sha256"){t.Fatalf("automatic deployment script malformed")}
  case <-time.After(3*time.Second): t.Fatal("mock SSH runner not invoked")
  }
  deadline:=time.Now().Add(3*time.Second)
@@ -162,7 +162,7 @@ func TestMockMonitorAlertsAndTelegram(t *testing.T) {
  t.Setenv("ALERT_MEMORY_PERCENT","90")
  t.Setenv("ALERT_DISK_PERCENT","90")
  messages:=make(chan string,8)
- upstream:=httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+ upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
   switch r.URL.Path {
   case "/v4/linode/instances":
    _,_=w.Write([]byte(`{"pages":1,"data":[{"id":45,"label":"mock-node","status":"running","ipv4":["8.8.8.8"]}]}`))

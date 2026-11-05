@@ -53,13 +53,30 @@ func TestBrowserPOSTOriginProtection(t *testing.T){
   if got.Code!=tc.want{t.Errorf("origin=%q type=%q expected=%d got=%d body=%s",tc.origin,tc.ctype,tc.want,got.Code,got.Body.String())}
  }
 }
-func TestPasswordFailureRateLimiting(t *testing.T){
+func TestRepeatedLoginFailuresDoNotLockOut(t *testing.T){
  t.Setenv("ADMIN_USERNAME","operator")
  t.Setenv("ADMIN_PASSWORD","very-strong-test-password")
  t.Setenv("ADMIN_TOKEN","api-token")
  h:=newHandler(testServer(http.DefaultClient))
  wrong:="Basic "+base64.StdEncoding.EncodeToString([]byte("operator:invalid-password"))
- for i:=0;i<8;i++{if w:=authRequest(h,"GET","/api/health",wrong,"","");w.Code!=401{t.Fatalf("attempt %d: %d",i,w.Code)}}
+ for i:=0;i<20;i++{if w:=authRequest(h,"GET","/api/health",wrong,"","");w.Code!=401{t.Fatalf("attempt %d: %d",i,w.Code)}}
  good:="Basic "+base64.StdEncoding.EncodeToString([]byte("operator:very-strong-test-password"))
- if w:=authRequest(h,"GET","/api/health",good,"","");w.Code!=429||w.Header().Get("Retry-After")==""{t.Fatalf("lockout expected 429, got %d",w.Code)}
+ if w:=authRequest(h,"GET","/api/health",good,"","");w.Code!=200||w.Header().Get("Retry-After")!=""{t.Fatalf("valid login after repeated failures expected 200, got %d",w.Code)}
+}
+func TestValidateAdminConfig(t *testing.T){
+ for _,tc:=range []struct{name,user,password,token string;valid bool}{
+  {"short browser password","admin","123456789","api-token",false},
+  {"missing browser password","admin","","api-token",false},
+  {"missing username","","long-enough-password","",false},
+  {"no credentials","","","",false},
+  {"browser login","admin","123456789012","",true},
+  {"API only","","","api-token",true},
+ }{
+  t.Run(tc.name,func(t *testing.T){
+   t.Setenv("ADMIN_USERNAME",tc.user)
+   t.Setenv("ADMIN_PASSWORD",tc.password)
+   t.Setenv("ADMIN_TOKEN",tc.token)
+   if err:=validateAdminConfig();(err==nil)!=tc.valid{t.Fatalf("valid=%v, error=%v",tc.valid,err)}
+  })
+ }
 }

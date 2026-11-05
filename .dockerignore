@@ -11,3 +11,10 @@ secrets/**
 *.sqlite*
 linode-node-manager
 *.log
+
+.env*
+!.env.example
+
+wp2-source-reference
+wp2-patch
+*.zip

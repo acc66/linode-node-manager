@@ -1,0 +1,36 @@
+Linode Node Manager 更新与检查命令
+
+请在服务器 SSH 终端依次执行。
+
+1. 进入项目目录
+cd /root/linode-node-manager
+
+2. 测试、重建并启动新版（Docker 构建会自动运行 Go 测试）
+docker compose --profile public up -d --build --force-recreate
+
+如果这一步失败，请先保留报错，不要继续。
+
+3. 检查容器状态
+docker compose --profile public ps
+
+4. 查看运行日志
+docker compose --profile public logs --tail=100 manager caddy
+
+5. 诊断 wp2 空节点问题（只读，不输出密钥）
+docker compose exec -T manager python3 < wp2-check.py
+
+6. 验证网页登录接口（提示时输入 .env 中的新密码，不要把密码发到聊天）
+curl --user admin https://ld.seox9.com/api/health
+
+预期返回：{"status":"ok","language":"go"}
+
+7. 浏览器打开并强制刷新
+https://ld.seox9.com
+
+需要发回的内容：第 2 步的报错（若有）、第 3 步状态、第 5 步诊断结果。
+请勿发送 .env 内容、Root 密码或 API Token。
+
+新版 wp2 连接方式：打开面板“wp2 节点”，输入管理员邮箱、密码及动态码（如启用），点击“连接 wp2”，自动同步全部节点。不需要部署 wp2 补丁。旧 wp2-check.py 仅诊断 muKey 接口，不能判断管理员连接是否成功。
+
+自动安装：选择运行中的 Linode 实例与 wp2 节点，点击“自动安装并验证”。无需再次输入服务器密码、面板 token 或任务 ID。节点域名须预先解析到实例；当前不自动修改 DNS/云防火墙。
+可选代理：选择 Linode 账号，保存 HTTP/SOCKS5 代理，勾选“使用所选账号的代理”后创建或开机；不勾选则直连。

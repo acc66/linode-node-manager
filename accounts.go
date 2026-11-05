@@ -108,6 +108,7 @@ func (s *accountStore) remove(id string)error{
 }
 func (s *Server) accountToken(id string)(string,error){
  if id==""||id=="legacy"{
+  if !s.legacyEnabled(){return "",errors.New("默认账号已移除或未配置")}
   t:=os.Getenv("LINODE_TOKEN")
   if t==""{return "",errors.New("legacy LINODE_TOKEN not configured")}
   return t,nil
@@ -119,6 +120,14 @@ func (s *Server) accountToken(id string)(string,error){
 func (s *Server) linodeFor(ctx context.Context,accountID,method,path string,payload io.Reader)([]byte,int,error){
  token,err:=s.accountToken(accountID);if err!=nil{return nil,503,err}
  base:=env("LINODE_API_BASE_URL","https://api.linode.com/v4")
+ if enabled,_:=ctx.Value(proxyContextKey{}).(bool);enabled{
+  proxy,ok:=s.proxyURL(accountID);if !ok{return nil,503,errors.New("当前账号未配置代理")}
+  client,err:=proxyClient(s.client,proxy);if err!=nil{return nil,503,err}
+  defer client.CloseIdleConnections()
+  temporary:=&Server{client:client}
+  b,status,err:=temporary.request(ctx,method,strings.TrimRight(base,"/")+path,token,payload)
+  if err!=nil{return nil,502,errors.New("Linode 代理请求失败；未切换直连")};return b,status,nil
+ }
  return s.request(ctx,method,strings.TrimRight(base,"/")+path,token,payload)
 }
 func (s *Server) accountsAPI(w http.ResponseWriter,r *http.Request){
@@ -126,7 +135,7 @@ func (s *Server) accountsAPI(w http.ResponseWriter,r *http.Request){
  switch r.Method{
  case http.MethodGet:
   out:=s.accounts.list()
-  if os.Getenv("LINODE_TOKEN")!=""{out=append([]ManagedAccount{{ID:"legacy",Name:"默认账号 (.env)"}},out...)}
+  if s.legacyEnabled(){out=append([]ManagedAccount{{ID:"legacy",Name:"默认账号 (.env)"}},out...)}
   send(w,200,map[string]any{"accounts":out})
  case http.MethodPost:
   var in struct{Name string `json:"name"`;Token string `json:"token"`}
@@ -141,7 +150,11 @@ func (s *Server) accountsAPI(w http.ResponseWriter,r *http.Request){
 func (s *Server) deleteAccount(w http.ResponseWriter,r *http.Request){
  if s.accounts==nil{fail(w,503,"Account storage unavailable");return}
  id:=r.PathValue("id")
- if id=="legacy"{fail(w,400,"Default account is managed in .env");return}
+ if id=="legacy"{
+  if !s.legacyEnabled(){fail(w,404,"Account not found");return}
+  if err:=s.saveRootPassword("disabled-account",0,"Default Linode account","disabled");err!=nil{fail(w,500,"无法保存默认账号移除状态");return}
+  send(w,200,map[string]bool{"deleted":true});return
+ }
  err:=s.accounts.remove(id)
  if errors.Is(err,os.ErrNotExist){fail(w,404,"Account not found");return}
  if err!=nil{fail(w,500,"Failed to save account changes");return}
@@ -185,4 +198,10 @@ func (s *Server) pollAccounts(ctx context.Context){
    }
   }
  }
+}
+
+func (s *Server) legacyEnabled()bool{
+ if os.Getenv("LINODE_TOKEN")==""{return false}
+ if s.credentials!=nil{if _,disabled:=s.credentials.token("disabled-account/0");disabled{return false}}
+ return true
 }

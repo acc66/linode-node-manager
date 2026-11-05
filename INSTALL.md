@@ -82,6 +82,7 @@ TG_CHAT_ID=
 
 - `ADMIN_USERNAME` / `ADMIN_PASSWORD`：浏览器访问 `https://panel.example.com` 时使用；密码至少 12 字符，建议生成 24+ 位强随机密码。
 - `ADMIN_TOKEN`：供非浏览器调用 API，不是网页登录密码，建议与密码不同。
+- 程序会在启动时校验登录配置。密码不足 12 位时会明确报错并退出；修改 `.env` 后执行 `docker compose --profile public up -d --build --force-recreate`。仅使用 API 时可同时留空用户名和密码，但必须设置 `ADMIN_TOKEN`。
 - `LINODE_TOKEN`：Linode API，按功能授予最小所需权限；为此前已公开的 Token **重新生成新值**。
 - `WP2_BASE_URL`：必须为 HTTPS，填写 wp2 API 根地址（不包含 `/mod_mu/nodes`）。
 - `WP2_API_TOKEN`：wp2 通信密钥。某些 wp2 设置还会按来源 IP 控制访问，请在 wp2 服务端确认。
@@ -214,7 +215,7 @@ docker compose --profile public logs --tail=100 manager
 | HTTPS 证书不成功 | 域名未指向当前 IP；80/443 被占用或被拦截；检查 `docker compose --profile public logs caddy` |
 | 页面弹出账号密码 | 预期行为；没有填写时返回 401 |
 | 正确密码仍返回 401 | 检查 `.env` 的 ADMIN_USERNAME/ADMIN_PASSWORD；检查长度至少 12 位；容器是否已重建 |
-| 登录返回 429 | 同一来源短时间出现 8 次错误请求；锁定期间等待 15 分钟，确认密码后再试 |
+| 登录返回 401 | 账号或密码不正确；登录失败不再触发次数锁定，确认浏览器没有缓存旧密码 |
 | Linode 列表错误 | 检查未过期的新 Linode Token、API 权限、管理机出站网络 |
 | wp2 节点空/502 | 检查 HTTPS API 根地址、通信密钥、wp2 接口限制与来源 IP 白名单 |
 | SSH 监控显示离线 | 检查密钥权限、known_hosts 指纹、SSH 连接与 Python 3 |
@@ -249,3 +250,39 @@ docker compose --profile public down
 - 为 Linode API 创建最小权限 Token。
 - 推荐额外限制可访问管理面板的公网 IP 或通过 VPN。
 - 操作真实云服务器前，在网页确认实例 ID 及动作。
+
+## 11. 通过 API 创建 Linode 服务器
+
+在「Linode 多账号管理」中添加 Token 并选择目标账号，点击「加载创建选项」。选择地区、套餐及系统镜像，填写名称和 Root 密码，再点击「创建并开机」。确认框会显示账号、地区、套餐价格与系统；确认后才发送创建请求，创建会产生费用。Token 需要拥有 Linode 创建所需的读写权限。
+
+地区和套餐由 Linode 实时返回，显示的基础价格仅供参考，地区差价与最终账单以 Linode 为准。请求超时后先刷新实例列表检查结果，避免重复创建。
+
+对应接口为 `GET /api/catalog/{regions|types|images}?account_id=账号ID` 和 `POST /api/instances?account_id=账号ID`。创建 JSON 包含 `label`、`region`、`type`、`image`、`root_pass`、`confirm: true`。Root 密码使用 ACCOUNT_ENCRYPTION_KEY 加密保存到 INSTANCE_CREDENTIALS_FILE（默认 /data/instance-credentials.enc）。列表只返回是否保存，点击“查看密码”后才通过已认证接口读取；请备份加密文件和密钥。创建服务器不会自动安装 XboardNode-Plus；SSH 密钥、known_hosts 与节点安装另行配置。
+
+## 12. 实例 IP、密码和删除
+
+列表显示 IPv4、IPv6、地区和套餐。创建后刷新列表查看启动与 IP 分配状态。通过本面板新建的实例自动加密保存 Root 密码，点击“查看密码”可查看；已有实例的密码无法从 Linode API 找回。删除实例需要输入实例 ID，成功后清除该账号对应的保存密码。删除永久移除云端实例及其磁盘。
+
+wp2 返回空列表时运行只读诊断：`docker compose exec -T manager python3 < wp2-check.py`，输出只包含 HTTP 状态、认证结果、数据结构及节点 ID，不输出密钥或完整配置。管理机当前 muKey 与 wp2 应保持一致；来源 IP 限制需要在 wp2 端检查。
+
+## 13. 不修改 wp2：连接管理员接口
+
+重建管理面板后，在“wp2 节点”中填写 wp2 管理员邮箱、密码及两步动态码（如启用），点击“连接 wp2”。程序通过 `/auth/login` 登录，随后验证 `/admin/node/ajax` 的管理员权限并分页同步全部节点。
+
+登录密码和动态码不保存；登录 Cookie 使用 ACCOUNT_ENCRYPTION_KEY 加密，存放在 INSTANCE_CREDENTIALS_FILE 中，浏览器不会收到 Cookie。会话过期后重新连接。断开连接会删除本地保存的会话，不会注销其他浏览器中的 wp2 会话。没有管理员连接时仍使用原有 muKey 接口；管理员会话过期时不会静默切回可能返回空列表的旧接口。
+
+wp2 如启用网页验证码，当前连接表单不能完成该验证，会明确提示；不需要为此修改 wp2 认证设置。连接后不需要部署 wp2 管理视图补丁。
+
+## 14. Linode HTTP / SOCKS5 可选代理
+
+选择具体 Linode 账号，填写 `http://用户:密码@主机:端口` 或 `socks5://用户:密码@主机:端口`，点击“加密保存代理”。代理密码不回显。创建、开机等操作前勾选“使用所选账号的代理”；不勾选时直连。代理只作用于 Linode API，不代理 SSH、wp2 登录或远端下载。代理失败不会回退直连。删除 Linode 账号不会删除云服务器；移除默认账号会持久禁用该默认账号，原 `.env` 中的 Token 不被远端撤销。
+
+## 15. 自动安装、证书与恢复
+
+在“安装 XboardNode-Plus”中选择运行中的服务器和 wp2 节点，点击“自动安装并验证”并确认目标。程序自动获取节点协议/端口/域名，下载 acc66/XboardNode-Plus v1.18 的对应架构二进制并校验 SHA256，写入受限配置，设置 systemd 开机自启与故障重启，并验证服务拥有的节点监听端口。页面自动查询任务，无需输入任务 ID。
+
+需要证书的协议使用节点域名申请 HTTP-01 证书，由 XboardNode-Plus 内置 CertMagic 自动续期和重新加载。域名解析、80 端口和云防火墙仍须正确；当前不自动修改外部 DNS 或云防火墙。UFW 已启用时会放行节点端口及申请证书所需的 TCP 80；失败恢复不撤销已新增的 UFW 放行规则。不会自动覆盖其他节点配置，也不会在证书申请失败时偷偷退回自签名。Reality 模式使用 wp2 提供的配置。
+
+SSH 优先使用配置好的私钥与已验证主机密钥。没有私钥时使用本面板加密保存的 Root 密码自动连接，首次信任主机密钥并持久保存到 `/data/ssh-bootstrap/known_hosts`，后续密钥变更会拒绝连接。已有实例若未保存密码且未配置 SSH 密钥，无法自动登录。自动部署需要 root 与 systemd；Python/openssl 不存在时支持 Debian/Ubuntu 自动安装依赖。
+
+安装失败时尝试恢复原程序、配置与服务状态；备份保存在远端 `/etc/XboardNode-Plus/backups`。本地健康检查只证明服务和端口运行，不证明真实客户端能够从公网连接。

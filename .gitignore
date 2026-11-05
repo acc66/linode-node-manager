@@ -7,3 +7,12 @@ __pycache__/
 secrets/
 *.pem
 *.key
+
+# Local environment backups
+.env*
+!.env.example
+
+# Local wp2 source and optional patch artifacts
+wp2-source-reference/
+wp2-patch/
+*.zip

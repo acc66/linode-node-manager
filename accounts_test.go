@@ -4,7 +4,6 @@ import (
  "context"
  "encoding/json"
  "net/http"
- "net/http/httptest"
  "os"
  "path/filepath"
  "strings"
@@ -41,7 +40,7 @@ func TestMultiAccountAPIsIsolation(t *testing.T){
  second,_:=store.add("account-b",strings.Repeat("b",64))
  var mu sync.Mutex
  actions:=map[string][]string{}
- upstream:=httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+ upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
   token:=strings.TrimPrefix(r.Header.Get("Authorization"),"Bearer ")
   if token!=strings.Repeat("a",64)&&token!=strings.Repeat("b",64){t.Errorf("wrong auth token")}
   mu.Lock();actions[token]=append(actions[token],r.Method+" "+r.URL.Path);mu.Unlock()
@@ -83,7 +82,7 @@ func TestMultiAccountMonitorKeyIsolation(t *testing.T){
  store,err:=initAccounts(filepath.Join(t.TempDir(),"accounts.enc"),strings.Repeat("k",40));if err!=nil{t.Fatal(err)}
  a,_:=store.add("first",strings.Repeat("a",64))
  b,_:=store.add("second",strings.Repeat("b",64))
- upstream:=httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+ upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
   _,_=w.Write([]byte(`{"pages":1,"data":[{"id":12,"label":"shared","status":"running","ipv4":["8.8.8.8"]}]}`))
  }))
  defer upstream.Close();t.Setenv("LINODE_API_BASE_URL",upstream.URL+"/v4")

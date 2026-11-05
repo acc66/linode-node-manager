@@ -14,6 +14,10 @@ jobs:
           go-version: '1.23'
       - name: Go unit and mock integration tests
         run: go test -count=1 -race ./...
+      - name: Automatic deployment and dashboard mock tests
+        run: |
+          python3 -m unittest -v test_deploy_node
+          node tests/dashboard.test.cjs
       - name: Go vet
         run: go vet ./...
       - name: Go build

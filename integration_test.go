@@ -221,7 +221,7 @@ func TestAlertsForThresholdAndService(t *testing.T) {
  for _,tt:=range cases{if got:=alertsFor(tt.v);got!=tt.want{t.Errorf("got alert %q want %q",got,tt.want)}}
 }
 
-func ExampleShellQuote() {
+func Example() {
  fmt.Println(shellQuote("some' text"))
  // Output: 'some'"'"' text'
 }

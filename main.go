@@ -24,6 +24,7 @@ type Server struct {
  mu sync.RWMutex
  status map[int]Snapshot
  jobs map[string]Job
+ sshRun func(context.Context,string,string)(string,error)
 }
 type Snapshot struct {
  ID int `json:"id"`
@@ -108,6 +109,7 @@ func ssh(ctx context.Context,ip,script string)(string,error){
  cmd:=exec.CommandContext(ctx,"ssh","-i",key,"-o","BatchMode=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile="+known,"-o","ConnectTimeout=8",user+"@"+ip,"bash -s")
  cmd.Stdin=strings.NewReader(script);b,e:=cmd.CombinedOutput();return string(b),e
 }
+func (s *Server) runSSH(ctx context.Context,ip,script string)(string,error){if s.sshRun!=nil{return s.sshRun(ctx,ip,script)};return ssh(ctx,ip,script)}
 func publicIP(i Instance)string{for _,v:=range i.IPv4{ip:=net.ParseIP(v);if ip!=nil&&ip.To4()!=nil&&!ip.IsLoopback()&&!ip.IsPrivate()&&!ip.IsLinkLocalUnicast(){return v}};return ""}
 const probeScript = `python3 - <<'PY'
 import json,os,time,subprocess
@@ -142,7 +144,7 @@ func (s *Server) poll(ctx context.Context){
   old:=Snapshot{};s.mu.RLock();old=s.status[inst.ID];s.mu.RUnlock()
   next:=Snapshot{ID:inst.ID,Label:inst.Label,State:"offline",Updated:time.Now().UTC().Format(time.RFC3339)}
   if inst.Status=="running"&&publicIP(inst)!=""{
-   c,cancel:=context.WithTimeout(ctx,20*time.Second);output,err:=ssh(c,publicIP(inst),probeScript);cancel()
+   c,cancel:=context.WithTimeout(ctx,20*time.Second);output,err:=s.runSSH(c,publicIP(inst),probeScript);cancel()
    if err==nil{
     var v struct{CPU float64 `json:"cpu"`;Memory float64 `json:"memory"`;Disk float64 `json:"disk"`;Uptime float64 `json:"uptime"`;Service string `json:"service"`}
     if json.Unmarshal([]byte(output),&v)==nil&&v.CPU>=0&&v.CPU<=100&&v.Memory>=0&&v.Memory<=100&&v.Disk>=0&&v.Disk<=100&&v.Uptime>=0{next.State="online";next.CPU=v.CPU;next.Memory=v.Memory;next.Disk=v.Disk;next.Uptime=v.Uptime;next.Service=v.Service}
@@ -175,7 +177,7 @@ func (s *Server) install(w http.ResponseWriter,r *http.Request){
   ctx,cancel:=context.WithTimeout(context.Background(),15*time.Minute);defer cancel()
   // Use remote bash stdin to avoid placing the token in the ssh command line.
   script:="set -e\ncurl -fsSL https://raw.githubusercontent.com/acc66/XboardNode-Plus/main/install.sh -o /tmp/xboard-install.sh\nbash /tmp/xboard-install.sh --mode node --panel "+shellQuote(base)+" --token "+shellQuote(token)+" --node-id "+strconv.Itoa(in.TargetID)+"\n"
-  output,err:=ssh(ctx,publicIP(inst),script)
+  output,err:=s.runSSH(ctx,publicIP(inst),script)
   output=strings.ReplaceAll(output,token,"[REDACTED]")
   if len(output)>12000{output=output[len(output)-12000:]}
   state:="success";if err!=nil{state="failed";output+="\nInstallation failed"}
@@ -184,8 +186,7 @@ func (s *Server) install(w http.ResponseWriter,r *http.Request){
  send(w,202,map[string]string{"job_id":id,"status":"queued"})
 }
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
-func main(){
- s:=&Server{client:&http.Client{Timeout:35*time.Second,CheckRedirect:func(_ *http.Request,_ []*http.Request)error{return http.ErrUseLastResponse}},status:map[int]Snapshot{},jobs:map[string]Job{}}
+func newHandler(s *Server) http.Handler {
  mux:=http.NewServeMux()
  mux.HandleFunc("GET /",func(w http.ResponseWriter,r *http.Request){w.Header().Set("Content-Type","text/html; charset=utf-8");io.WriteString(w,htmlPage)})
  mux.HandleFunc("GET /api/health",s.auth(func(w http.ResponseWriter,r *http.Request){send(w,200,map[string]string{"status":"ok","language":"go"})}))
@@ -196,6 +197,12 @@ func main(){
  mux.HandleFunc("POST /api/deployments/install",s.auth(s.install))
  mux.HandleFunc("GET /api/deployments/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){s.mu.RLock();v,ok:=s.jobs[r.PathValue("id")];s.mu.RUnlock();if !ok{fail(w,404,"Unknown job");return};send(w,200,v)}))
  mux.HandleFunc("POST /api/instances/{id}/{action}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));action:=r.PathValue("action");if e!=nil||id<=0||(action!="boot"&&action!="shutdown"&&action!="reboot"){fail(w,400,"Invalid action");return};b,st,e:=s.linode(r.Context(),"POST",fmt.Sprintf("/linode/instances/%d/%s",id,action),strings.NewReader("{}"));if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
+ return mux
+}
+func main(){
+ s:=&Server{client:&http.Client{Timeout:35*time.Second,CheckRedirect:func(_ *http.Request,_ []*http.Request)error{return http.ErrUseLastResponse}},status:map[int]Snapshot{},jobs:map[string]Job{}}
+
+ mux:=newHandler(s)
  ctx,cancel:=context.WithCancel(context.Background());defer cancel()
  if env("MONITOR_ENABLED","false")=="true"{go s.monitoring(ctx)}
  addr:=env("LISTEN_ADDR","0.0.0.0:8000");log.Printf("Linode Node Manager Go listening on %s",addr);log.Fatal(http.ListenAndServe(addr,mux))

@@ -46,7 +46,8 @@ async def linode(method,path,payload=None):
 
 register_deployments(app,auth,linode)
 register_wp2(app,auth)
-\nclass Create(BaseModel):
+
+class Create(BaseModel):
     label:str=Field(min_length=3,max_length=64,pattern=r"^[a-zA-Z0-9-]+$")
     region:str
     type:str
@@ -129,4 +130,5 @@ async function del(id){if(prompt('输入实例 ID '+id+' 确认永久删除')!==
 async function create(){if(!confirm('确认创建付费 Linode 实例？'))return;try{let x=await req('/instances',{method:'POST',body:JSON.stringify({label:document.getElementById('label').value,region:document.getElementById('region').value,type:document.getElementById('type').value,authorized_keys:[document.getElementById('key').value],confirm_billable:true})});msg('创建成功，实例 ID '+x.id);await load()}catch(e){msg(e.message)}}
 async function nodes(){try{let d=await req("/wp2/nodes");document.getElementById("nodes").textContent=JSON.stringify(d,null,2)}catch(e){msg(e.message)}}
 async function install(){if(!confirm("确认在选中服务器安装或重配 XboardNode-Plus？"))return;try{let d=await req("/deployments/install",{method:"POST",body:JSON.stringify({instance_id:Number(document.getElementById("did").value),mode:document.getElementById("mode").value,target_id:Number(document.getElementById("tid").value)})});document.getElementById("job").value=d.job_id;msg("任务已提交 "+d.job_id)}catch(e){msg(e.message)}}
-async function checkjob(){try{let d=await req("/deployments/"+encodeURIComponent(document.getElementById("job").value));document.getElementById("log").textContent=d.status+"\\n"+d.log}catch(e){msg(e.message)}}\n</script></html>"""
+async function checkjob(){try{let d=await req("/deployments/"+encodeURIComponent(document.getElementById("job").value));document.getElementById("log").textContent=d.status+"\\n"+d.log}catch(e){msg(e.message)}}
+</script></html>"""

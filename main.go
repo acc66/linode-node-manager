@@ -3,6 +3,7 @@ package main
 import (
  "context"
  "crypto/subtle"
+ "crypto/sha256"
  "encoding/json"
  "errors"
  "fmt"
@@ -24,6 +25,7 @@ type Server struct {
  mu sync.RWMutex
  status map[int]Snapshot
  jobs map[string]Job
+ failedAuth map[string]loginAttempt
  sshRun func(context.Context,string,string)(string,error)
 }
 type Snapshot struct {
@@ -54,7 +56,53 @@ func env(k,d string)string {if v:=os.Getenv(k);v!="" {return v};return d}
 func number(k string,d int)int {v,e:=strconv.Atoi(os.Getenv(k));if e!=nil{return d};return v}
 func send(w http.ResponseWriter,status int,v any){w.Header().Set("Content-Type","application/json");w.WriteHeader(status);_ =json.NewEncoder(w).Encode(v)}
 func fail(w http.ResponseWriter,status int,e string){send(w,status,map[string]string{"error":e})}
-func (s *Server) auth(next http.HandlerFunc)http.HandlerFunc{return func(w http.ResponseWriter,r *http.Request){token:=os.Getenv("ADMIN_TOKEN");auth:=r.Header.Get("Authorization");if token==""||subtle.ConstantTimeCompare([]byte(auth),[]byte("Bearer "+token))!=1{fail(w,401,"Unauthorized");return};next(w,r)}}
+type loginAttempt struct{Count int;Until time.Time}
+func safeEqual(a,b string)bool{
+ x,y:=sha256.Sum256([]byte(a)),sha256.Sum256([]byte(b))
+ return subtle.ConstantTimeCompare(x[:],y[:])==1
+}
+func (s *Server) auth(next http.HandlerFunc)http.HandlerFunc{return func(w http.ResponseWriter,r *http.Request){
+ w.Header().Set("Cache-Control","no-store")
+ w.Header().Set("X-Content-Type-Options","nosniff")
+ w.Header().Set("Referrer-Policy","no-referrer")
+ w.Header().Set("X-Frame-Options","DENY")
+ w.Header().Set("Content-Security-Policy","default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+ ip,_,err:=net.SplitHostPort(r.RemoteAddr);if err!=nil{ip=r.RemoteAddr}
+ now:=time.Now()
+ s.mu.Lock()
+ if s.failedAuth==nil{s.failedAuth=make(map[string]loginAttempt)}
+ a:=s.failedAuth[ip]
+ if now.After(a.Until){a=loginAttempt{}}
+ blocked:=a.Count>=8&&now.Before(a.Until)
+ s.mu.Unlock()
+ if blocked{w.Header().Set("Retry-After","900");fail(w,429,"Too many failed logins");return}
+ bearer:=os.Getenv("ADMIN_TOKEN")
+ user:=os.Getenv("ADMIN_USERNAME")
+ pass:=os.Getenv("ADMIN_PASSWORD")
+ authorized:=false
+ isBearer:=false
+ if v:=r.Header.Get("Authorization");bearer!=""&&strings.HasPrefix(v,"Bearer "){
+  authorized=safeEqual(v,"Bearer "+bearer);isBearer=authorized
+ }else if u,p,ok:=r.BasicAuth();ok&&user!=""&&len(pass)>=12{
+  authorized=safeEqual(u,user)&&safeEqual(p,pass)
+ }
+ if !authorized{
+  s.mu.Lock();a=s.failedAuth[ip];if now.After(a.Until){a=loginAttempt{}};a.Count++;a.Until=now.Add(15*time.Minute);s.failedAuth[ip]=a;s.mu.Unlock()
+  w.Header().Set("WWW-Authenticate",`Basic realm="Linode Manager", charset="UTF-8"`)
+  fail(w,401,"Unauthorized");return
+ }
+ s.mu.Lock();delete(s.failedAuth,ip);s.mu.Unlock()
+ if r.Method=="POST"&&!isBearer{
+  if r.Header.Get("Sec-Fetch-Site")=="cross-site"{fail(w,403,"Cross-site request rejected");return}
+  if origin:=r.Header.Get("Origin");origin!=""{
+   u,err:=url.Parse(origin);if err!=nil||u.Host!=r.Host||u.Scheme!="https"&&!(u.Scheme=="http"&&(r.Host=="127.0.0.1:8000"||r.Host=="localhost:8000")){
+    fail(w,403,"Cross-origin request rejected");return
+   }
+  }
+  if r.Header.Get("Content-Type")!="application/json"{fail(w,415,"JSON content type required");return}
+ }
+ next(w,r)
+}}
 func (s *Server) request(ctx context.Context,method,endpoint,token string,payload io.Reader)([]byte,int,error){
  req,e:=http.NewRequestWithContext(ctx,method,endpoint,payload);if e!=nil{return nil,0,e}
  req.Header.Set("Authorization","Bearer "+token)
@@ -188,7 +236,7 @@ func (s *Server) install(w http.ResponseWriter,r *http.Request){
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func newHandler(s *Server) http.Handler {
  mux:=http.NewServeMux()
- mux.HandleFunc("GET /",func(w http.ResponseWriter,r *http.Request){w.Header().Set("Content-Type","text/html; charset=utf-8");io.WriteString(w,htmlPage)})
+ mux.HandleFunc("GET /",s.auth(func(w http.ResponseWriter,r *http.Request){w.Header().Set("Content-Type","text/html; charset=utf-8");io.WriteString(w,htmlPage)}))
  mux.HandleFunc("GET /api/health",s.auth(func(w http.ResponseWriter,r *http.Request){send(w,200,map[string]string{"status":"ok","language":"go"})}))
  mux.HandleFunc("GET /api/instances",s.auth(func(w http.ResponseWriter,r *http.Request){items,e:=s.instances(r.Context());if e!=nil{fail(w,502,"Linode API unavailable");return};send(w,200,map[string]any{"instances":items})}))
  mux.HandleFunc("GET /api/instances/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));if e!=nil||id<=0{fail(w,400,"Invalid instance ID");return};b,st,e:=s.linode(r.Context(),"GET",fmt.Sprintf("/linode/instances/%d",id),nil);if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
@@ -207,4 +255,4 @@ func main(){
  if env("MONITOR_ENABLED","false")=="true"{go s.monitoring(ctx)}
  addr:=env("LISTEN_ADDR","0.0.0.0:8000");log.Printf("Linode Node Manager Go listening on %s",addr);log.Fatal(http.ListenAndServe(addr,mux))
 }
-const htmlPage = `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Linode Node Manager Go</title><style>body{background:#0f172a;color:#e2e8f0;font:15px system-ui;max-width:1000px;margin:auto;padding:24px}section{background:#1e293b;border-radius:12px;padding:18px;margin:14px 0}input,select,button{padding:9px;margin:4px;background:#334155;color:white;border:1px solid #64748b;border-radius:7px}button{background:#2563eb;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #475569}</style><h1>Linode Go 管理面板</h1><section><input type="password" id="token" placeholder="ADMIN_TOKEN"><button onclick="load()">刷新</button><p id="msg"></p></section><section><h2>服务器</h2><div id="instances"></div></section><section><h2>wp2 节点</h2><button onclick="nodes()">同步 wp2 节点</button><p id="nodehint">节点在线状态需要 wp2 心跳接口；此处不将配置状态误判为在线。</p><pre id="nodes"></pre></section><section><h2>安装 XboardNode-Plus</h2><input id="instance" type="number" placeholder="Linode ID"><select id="node"><option value="">请先同步 wp2 节点</option></select><button onclick="install()">安装</button><input id="job" placeholder="任务 ID"><button onclick="job()">查询任务</button><pre id="joblog"></pre></section><section><h2>CPU / 内存 / 磁盘</h2><button onclick="monitor()">刷新监控</button><pre id="metrics"></pre></section><script>const token=()=>document.getElementById('token').value;async function api(path,options={}){let r=await fetch('/api'+path,{...options,headers:{Authorization:'Bearer '+token(),'Content-Type':'application/json'}});let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function power(id,action){if(!confirm('确认对实例 '+id+' 执行 '+action+'？'))return;try{await api('/instances/'+id+'/'+action,{method:'POST'});await load()}catch(e){document.getElementById('msg').textContent=e.message}}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){try{let d=await api('/instances');document.getElementById('instances').innerHTML='<table><tr><th>ID</th><th>名称</th><th>状态</th><th>操作</th></tr>'+d.instances.map(i=>'<tr><td>'+Number(i.id)+'</td><td>'+esc(i.label)+'</td><td>'+esc(i.status)+'</td><td><button onclick="power('+Number(i.id)+',\'boot\')">开机</button><button onclick="power('+Number(i.id)+',\'shutdown\')">关机</button><button onclick="power('+Number(i.id)+',\'reboot\')">重启</button></td></tr>').join('')+'</table>';document.getElementById('msg').textContent='已加载 '+d.instances.length+' 台'}catch(e){document.getElementById('msg').textContent=e.message}}async function nodes(){try{let d=await api('/wp2/nodes');let a=d.nodes||[];let sel=document.getElementById('node');sel.replaceChildren();let empty=document.createElement('option');empty.value='';empty.textContent='请选择 wp2 节点';sel.appendChild(empty);for(let n of a){let o=document.createElement('option');o.value=String(n.id);o.textContent=String(n.name||'节点')+' (#'+n.id+')';sel.appendChild(o)}show('nodes',a);document.getElementById('nodehint').textContent='已同步 '+a.length+' 个节点；在线状态：待心跳接口验证'}catch(e){show('nodes',e.message)}}async function monitor(){try{show('metrics',(await api('/monitor')).instances)}catch(e){show('metrics',e.message)}}async function install(){if(!document.getElementById('node').value){show('joblog','请先同步并选择 wp2 节点');return}if(!confirm('确认在服务器安装后端？'))return;try{let d=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(document.getElementById('instance').value),mode:'node',target_id:Number(document.getElementById('node').value)})});document.getElementById('job').value=d.job_id;show('joblog',d)}catch(e){show('joblog',e.message)}}async function job(){try{show('joblog',await api('/deployments/'+encodeURIComponent(document.getElementById('job').value)))}catch(e){show('joblog',e.message)}}setInterval(()=>{if(token())monitor()},30000)</script></html>`
+const htmlPage = `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Linode Node Manager Go</title><style>body{background:#0f172a;color:#e2e8f0;font:15px system-ui;max-width:1000px;margin:auto;padding:24px}section{background:#1e293b;border-radius:12px;padding:18px;margin:14px 0}input,select,button{padding:9px;margin:4px;background:#334155;color:white;border:1px solid #64748b;border-radius:7px}button{background:#2563eb;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #475569}</style><h1>Linode Go 管理面板</h1><section><p>已登录管理面板（账号密码由浏览器安全认证）。请使用 HTTPS 访问公网地址。</p><button onclick="load()">刷新</button><p id="msg"></p></section><section><h2>服务器</h2><div id="instances"></div></section><section><h2>wp2 节点</h2><button onclick="nodes()">同步 wp2 节点</button><p id="nodehint">节点在线状态需要 wp2 心跳接口；此处不将配置状态误判为在线。</p><pre id="nodes"></pre></section><section><h2>安装 XboardNode-Plus</h2><input id="instance" type="number" placeholder="Linode ID"><select id="node"><option value="">请先同步 wp2 节点</option></select><button onclick="install()">安装</button><input id="job" placeholder="任务 ID"><button onclick="job()">查询任务</button><pre id="joblog"></pre></section><section><h2>CPU / 内存 / 磁盘</h2><button onclick="monitor()">刷新监控</button><pre id="metrics"></pre></section><script>async function api(path,options={}){let r=await fetch('/api'+path,{...options,credentials:'same-origin',headers:{'Content-Type':'application/json'}});let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function power(id,action){if(!confirm('确认对实例 '+id+' 执行 '+action+'？'))return;try{await api('/instances/'+id+'/'+action,{method:'POST'});await load()}catch(e){document.getElementById('msg').textContent=e.message}}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){try{let d=await api('/instances');document.getElementById('instances').innerHTML='<table><tr><th>ID</th><th>名称</th><th>状态</th><th>操作</th></tr>'+d.instances.map(i=>'<tr><td>'+Number(i.id)+'</td><td>'+esc(i.label)+'</td><td>'+esc(i.status)+'</td><td><button onclick="power('+Number(i.id)+',\'boot\')">开机</button><button onclick="power('+Number(i.id)+',\'shutdown\')">关机</button><button onclick="power('+Number(i.id)+',\'reboot\')">重启</button></td></tr>').join('')+'</table>';document.getElementById('msg').textContent='已加载 '+d.instances.length+' 台'}catch(e){document.getElementById('msg').textContent=e.message}}async function nodes(){try{let d=await api('/wp2/nodes');let a=d.nodes||[];let sel=document.getElementById('node');sel.replaceChildren();let empty=document.createElement('option');empty.value='';empty.textContent='请选择 wp2 节点';sel.appendChild(empty);for(let n of a){let o=document.createElement('option');o.value=String(n.id);o.textContent=String(n.name||'节点')+' (#'+n.id+')';sel.appendChild(o)}show('nodes',a);document.getElementById('nodehint').textContent='已同步 '+a.length+' 个节点；在线状态：待心跳接口验证'}catch(e){show('nodes',e.message)}}async function monitor(){try{show('metrics',(await api('/monitor')).instances)}catch(e){show('metrics',e.message)}}async function install(){if(!document.getElementById('node').value){show('joblog','请先同步并选择 wp2 节点');return}if(!confirm('确认在服务器安装后端？'))return;try{let d=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(document.getElementById('instance').value),mode:'node',target_id:Number(document.getElementById('node').value)})});document.getElementById('job').value=d.job_id;show('joblog',d)}catch(e){show('joblog',e.message)}}async function job(){try{show('joblog',await api('/deployments/'+encodeURIComponent(document.getElementById('job').value)))}catch(e){show('joblog',e.message)}}setInterval(()=>monitor(),30000)</script></html>`

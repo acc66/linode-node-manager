@@ -60,7 +60,7 @@ async def perform(job_id, body, ip):
         job["status"]="success"
     except Exception as exc:
         job["status"]="failed"
-        job["log"]=clean_log(job["log"]+"\n"+str(exc),body.panel_token)
+        job["log"]=clean_log(job["log"]+"\n"+str(exc),panel_token)
     finally:
         job["updated_at"]=datetime.now(timezone.utc).isoformat()
 

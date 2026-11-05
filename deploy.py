@@ -26,8 +26,6 @@ def authorized():
 
 class InstallRequest(BaseModel):
     instance_id: int = Field(gt=0)
-    panel_url: str = Field(pattern=r"^https://[^\s/]+", max_length=255)
-    panel_token: str = Field(min_length=1, max_length=4096)
     mode: str = Field(pattern=r"^(node|machine)$")
     target_id: int = Field(gt=0)
     ssh_user: str = Field(default="root", pattern=r"^[a-z_][a-z0-9_-]*$", max_length=32)
@@ -36,7 +34,13 @@ def clean_log(s, secret):
     return s.replace(secret, "[REDACTED]")[-12000:]
 
 async def perform(job_id, body, ip):
-    job=JOBS[job_id]\n    panel_url=os.getenv("WP2_BASE_URL","").rstrip("/")\n    panel_token=os.getenv("WP2_API_TOKEN","")\n    if not panel_url.startswith("https://") or not panel_token:\n        job["status"]="failed"\n        job["log"]="Configure WP2_BASE_URL and WP2_API_TOKEN"\n        return
+    job=JOBS[job_id]
+    panel_url=os.getenv("WP2_BASE_URL","").rstrip("/")
+    panel_token=os.getenv("WP2_API_TOKEN","")
+    if not panel_url.startswith("https://") or not panel_token:
+        job["status"]="failed"
+        job["log"]="Configure WP2_BASE_URL and WP2_API_TOKEN"
+        return
     key=os.getenv("SSH_PRIVATE_KEY_PATH","/run/secrets/linode_ssh_key")
     known=os.getenv("SSH_KNOWN_HOSTS_PATH","/run/secrets/known_hosts")
     try:

@@ -36,7 +36,7 @@ def clean_log(s, secret):
     return s.replace(secret, "[REDACTED]")[-12000:]
 
 async def perform(job_id, body, ip):
-    job=JOBS[job_id]
+    job=JOBS[job_id]\n    panel_url=os.getenv("WP2_BASE_URL","").rstrip("/")\n    panel_token=os.getenv("WP2_API_TOKEN","")\n    if not panel_url.startswith("https://") or not panel_token:\n        job["status"]="failed"\n        job["log"]="Configure WP2_BASE_URL and WP2_API_TOKEN"\n        return
     key=os.getenv("SSH_PRIVATE_KEY_PATH","/run/secrets/linode_ssh_key")
     known=os.getenv("SSH_KNOWN_HOSTS_PATH","/run/secrets/known_hosts")
     try:
@@ -45,7 +45,7 @@ async def perform(job_id, body, ip):
         job["status"]="running"
         async with asyncssh.connect(ip, username=body.ssh_user, client_keys=[key], known_hosts=known, connect_timeout=20) as conn:
             mode_arg="--node-id" if body.mode=="node" else "--machine-id"
-            args=["--mode",body.mode,"--panel",body.panel_url,"--token",body.panel_token,mode_arg,str(body.target_id)]
+            args=["--mode",body.mode,"--panel",panel_url,"--token",panel_token,mode_arg,str(body.target_id)]
             script=("set -euo pipefail\n"
                     "test \"$(id -u)\" = 0\n"
                     "command -v curl >/dev/null || (apt-get update -qq && apt-get install -y -qq curl ca-certificates)\n"
@@ -54,7 +54,7 @@ async def perform(job_id, body, ip):
                     "bash \"$tmp\" "+" ".join(shlex.quote(x) for x in args)+"\n"
                     "systemctl is-active xboard-node.service\n")
             result=await asyncio.wait_for(conn.run("bash -s",input=script,check=False),timeout=900)
-            job["log"]=clean_log(result.stdout+"\n"+result.stderr,body.panel_token)
+            job["log"]=clean_log(result.stdout+"\n"+result.stderr,panel_token)
             if result.exit_status != 0:
                 raise RuntimeError("Installer exited with status "+str(result.exit_status))
         job["status"]="success"

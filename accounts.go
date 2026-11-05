@@ -13,6 +13,9 @@ import (
  "net/http"
  "io"
  "os"
+ "log"
+ "strconv"
+ "time"
  "path/filepath"
  "sort"
  "strings"
@@ -147,4 +150,39 @@ func (s *Server) deleteAccount(w http.ResponseWriter,r *http.Request){
  for k:=range s.accountStatus{if strings.HasPrefix(k,id+"/"){delete(s.accountStatus,k)}}
  s.mu.Unlock()
  send(w,200,map[string]bool{"deleted":true})
+}
+
+func (s *Server) pollAccounts(ctx context.Context){
+ if s.accounts==nil{return}
+ for _,account:=range s.accounts.list(){
+  instances,err:=s.instancesFor(ctx,account.ID)
+  if err!=nil{log.Printf("monitor: account %s lookup failed: %v",account.ID,err);continue}
+  for _,inst:=range instances{
+   key:=account.ID+"/"+strconv.Itoa(inst.ID)
+   s.mu.RLock();old:=s.accountStatus[key];s.mu.RUnlock()
+   next:=Snapshot{AccountID:account.ID,ID:inst.ID,Label:inst.Label,State:"offline",Updated:time.Now().UTC().Format(time.RFC3339)}
+   if inst.Status=="running"&&publicIP(inst)!=""{
+    probeCtx,cancel:=context.WithTimeout(ctx,20*time.Second)
+    output,probeErr:=s.runSSH(probeCtx,publicIP(inst),probeScript)
+    cancel()
+    if probeErr==nil{
+     var metric struct{CPU float64 `json:"cpu"`;Memory float64 `json:"memory"`;Disk float64 `json:"disk"`;Uptime float64 `json:"uptime"`;Service string `json:"service"`}
+     if json.Unmarshal([]byte(output),&metric)==nil&&metric.CPU>=0&&metric.CPU<=100&&metric.Memory>=0&&metric.Memory<=100&&metric.Disk>=0&&metric.Disk<=100&&metric.Uptime>=0{
+      next.State="online";next.CPU=metric.CPU;next.Memory=metric.Memory;next.Disk=metric.Disk;next.Uptime=metric.Uptime;next.Service=metric.Service
+     }
+    }
+   }
+   if next.State=="offline"{
+    next.Failures=old.Failures+1
+    if next.Failures>=number("ALERT_FAILURE_COUNT",3){next.Alert="offline"}
+   }else{next.Alert=alertsFor(next)}
+   s.mu.Lock()
+   if s.accountStatus==nil{s.accountStatus=map[string]Snapshot{}}
+   s.accountStatus[key]=next;s.mu.Unlock()
+   if next.Alert!=old.Alert{
+    if next.Alert!=""{go s.telegram(fmt.Sprintf("🚨 Linode [%s] %s (#%d): %s",account.Name,inst.Label,inst.ID,next.Alert))}
+    if next.Alert==""&&old.Alert!=""{go s.telegram(fmt.Sprintf("✅ Linode [%s] %s (#%d) recovered",account.Name,inst.Label,inst.ID))}
+   }
+  }
+ }
 }

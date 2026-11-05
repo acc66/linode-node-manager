@@ -1,5 +1,7 @@
 # Linode Node Manager — Go
 
+**完整中文安装手册：** [INSTALL.md](INSTALL.md)（Debian 12、GitHub 编译包、账号密码、HTTPS、监控、Telegram、排错）。
+
 独立的 Go 1.22+ Linode 运维面板。主程序：`main.go`，不再使用 Python FastAPI。当前版本为 Go MVP，未完成真实 Linode/SSH/TG 联调。
 
 ## 已实现

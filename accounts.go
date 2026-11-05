@@ -11,6 +11,7 @@ import (
  "errors"
  "fmt"
  "net/http"
+ "io"
  "os"
  "path/filepath"
  "sort"
@@ -112,7 +113,7 @@ func (s *Server) accountToken(id string)(string,error){
  t,ok:=s.accounts.token(id);if !ok{return "",errors.New("unknown account")}
  return t,nil
 }
-func (s *Server) linodeFor(ctx context.Context,accountID,method,path string,payload *strings.Reader)([]byte,int,error){
+func (s *Server) linodeFor(ctx context.Context,accountID,method,path string,payload io.Reader)([]byte,int,error){
  token,err:=s.accountToken(accountID);if err!=nil{return nil,503,err}
  base:=env("LINODE_API_BASE_URL","https://api.linode.com/v4")
  return s.request(ctx,method,strings.TrimRight(base,"/")+path,token,payload)

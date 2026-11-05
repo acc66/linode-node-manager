@@ -105,25 +105,19 @@ func ssh(ctx context.Context,ip,script string)(string,error){
  cmd.Stdin=strings.NewReader(script);b,e:=cmd.CombinedOutput();return string(b),e
 }
 func publicIP(i Instance)string{for _,v:=range i.IPv4{ip:=net.ParseIP(v);if ip!=nil&&ip.To4()!=nil&&!ip.IsLoopback()&&!ip.IsPrivate()&&!ip.IsLinkLocalUnicast(){return v}};return ""}
-const probeScript = "python3 - <<'PY'
+const probeScript = `python3 - <<'PY'
 import json,os,time,subprocess
-"+
-"def cpu():
+def cpu():
  a=list(map(int,open('/proc/stat').readline().split()[1:]));return sum(a),a[3]+a[4]
-"+
-"a,b=cpu();time.sleep(.25);c,d=cpu()
-"+
-"m={}
+a,b=cpu();time.sleep(.25);c,d=cpu()
+m={}
 for line in open('/proc/meminfo'):
  k,v=line.split(':',1);m[k]=int(v.split()[0])
-"+
-"st=os.statvfs('/');total=st.f_blocks*st.f_frsize;free=st.f_bavail*st.f_frsize
-"+
-"svc=subprocess.run(['systemctl','is-active','xboard-node.service'],capture_output=True,text=True,timeout=5).stdout.strip()
-"+
-"print(json.dumps({'cpu':round(100*(1-(d-b)/max(1,c-a)),1),'memory':round(100*(1-m.get('MemAvailable',0)/max(1,m.get('MemTotal',1))),1),'disk':round(100*(1-free/max(1,total)),1),'uptime':int(float(open('/proc/uptime').read().split()[0])),'service':svc}))
+st=os.statvfs('/');total=st.f_blocks*st.f_frsize;free=st.f_bavail*st.f_frsize
+svc=subprocess.run(['systemctl','is-active','xboard-node.service'],capture_output=True,text=True,timeout=5).stdout.strip()
+print(json.dumps({'cpu':round(100*(1-(d-b)/max(1,c-a)),1),'memory':round(100*(1-m.get('MemAvailable',0)/max(1,m.get('MemTotal',1))),1),'disk':round(100*(1-free/max(1,total)),1),'uptime':int(float(open('/proc/uptime').read().split()[0])),'service':svc}))
 PY
-"
+`
 func (s *Server) telegram(msg string){
  token:=os.Getenv("TG_BOT_TOKEN");chat:=os.Getenv("TG_CHAT_ID");if token==""||chat==""{return}
  form:=url.Values{"chat_id":{chat},"text":{msg}}
@@ -172,15 +166,11 @@ func (s *Server) install(w http.ResponseWriter,r *http.Request){
   s.mu.Lock();s.jobs[id]=Job{ID:id,Status:"running"};s.mu.Unlock()
   ctx,cancel:=context.WithTimeout(context.Background(),15*time.Minute);defer cancel()
   // Use remote bash stdin to avoid placing the token in the ssh command line.
-  script:="set -e
-curl -fsSL https://raw.githubusercontent.com/acc66/XboardNode-Plus/main/install.sh -o /tmp/xboard-install.sh
-bash /tmp/xboard-install.sh --mode node --panel "+shellQuote(base)+" --token "+shellQuote(token)+" --node-id "+strconv.Itoa(in.TargetID)+"
-"
+  script:="set -e\ncurl -fsSL https://raw.githubusercontent.com/acc66/XboardNode-Plus/main/install.sh -o /tmp/xboard-install.sh\nbash /tmp/xboard-install.sh --mode node --panel "+shellQuote(base)+" --token "+shellQuote(token)+" --node-id "+strconv.Itoa(in.TargetID)+"\n"
   output,err:=ssh(ctx,publicIP(inst),script)
   output=strings.ReplaceAll(output,token,"[REDACTED]")
   if len(output)>12000{output=output[len(output)-12000:]}
-  state:="success";if err!=nil{state="failed";output+="
-Installation failed"}
+  state:="success";if err!=nil{state="failed";output+="\nInstallation failed"}
   s.mu.Lock();s.jobs[id]=Job{ID:id,Status:state,Log:output};s.mu.Unlock()
  }()
  send(w,202,map[string]string{"job_id":id,"status":"queued"})
@@ -192,6 +182,7 @@ func main(){
  mux.HandleFunc("GET /",func(w http.ResponseWriter,r *http.Request){w.Header().Set("Content-Type","text/html; charset=utf-8");io.WriteString(w,htmlPage)})
  mux.HandleFunc("GET /api/health",s.auth(func(w http.ResponseWriter,r *http.Request){send(w,200,map[string]string{"status":"ok","language":"go"})}))
  mux.HandleFunc("GET /api/instances",s.auth(func(w http.ResponseWriter,r *http.Request){items,e:=s.instances(r.Context());if e!=nil{fail(w,502,"Linode API unavailable");return};send(w,200,map[string]any{"instances":items})}))
+ mux.HandleFunc("GET /api/instances/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));if e!=nil||id<=0{fail(w,400,"Invalid instance ID");return};b,st,e:=s.linode(r.Context(),"GET",fmt.Sprintf("/linode/instances/%d",id),nil);if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
  mux.HandleFunc("GET /api/wp2/nodes",s.auth(s.wpNodes))
  mux.HandleFunc("GET /api/monitor",s.auth(func(w http.ResponseWriter,r *http.Request){s.mu.RLock();defer s.mu.RUnlock();items:=[]Snapshot{};for _,v:=range s.status{items=append(items,v)};send(w,200,map[string]any{"instances":items})}))
  mux.HandleFunc("POST /api/deployments/install",s.auth(s.install))
@@ -201,4 +192,4 @@ func main(){
  if env("MONITOR_ENABLED","false")=="true"{go s.monitoring(ctx)}
  addr:=env("LISTEN_ADDR","0.0.0.0:8000");log.Printf("Linode Node Manager Go listening on %s",addr);log.Fatal(http.ListenAndServe(addr,mux))
 }
-const htmlPage = `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Linode Node Manager Go</title><style>body{background:#0f172a;color:#e2e8f0;font:15px system-ui;max-width:1000px;margin:auto;padding:24px}section{background:#1e293b;border-radius:12px;padding:18px;margin:14px 0}input,select,button{padding:9px;margin:4px;background:#334155;color:white;border:1px solid #64748b;border-radius:7px}button{background:#2563eb;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #475569}</style><h1>Linode Go 管理面板</h1><section><input type="password" id="token" placeholder="ADMIN_TOKEN"><button onclick="load()">刷新</button><p id="msg"></p></section><section><h2>服务器</h2><div id="instances"></div></section><section><h2>wp2 节点</h2><button onclick="nodes()">获取节点</button><pre id="nodes"></pre></section><section><h2>安装 XboardNode-Plus</h2><input id="instance" type="number" placeholder="Linode ID"><input id="node" type="number" placeholder="wp2 节点 ID"><button onclick="install()">安装</button><input id="job" placeholder="任务 ID"><button onclick="job()">查询任务</button><pre id="joblog"></pre></section><section><h2>CPU / 内存 / 磁盘</h2><button onclick="monitor()">刷新监控</button><pre id="metrics"></pre></section><script>const token=()=>document.getElementById('token').value;async function api(path,options={}){let r=await fetch('/api'+path,{...options,headers:{Authorization:'Bearer '+token(),'Content-Type':'application/json'}});let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){try{let d=await api('/instances');show('instances',d.instances);document.getElementById('msg').textContent='已加载 '+d.instances.length+' 台'}catch(e){document.getElementById('msg').textContent=e.message}}async function nodes(){try{show('nodes',(await api('/wp2/nodes')).nodes)}catch(e){show('nodes',e.message)}}async function monitor(){try{show('metrics',(await api('/monitor')).instances)}catch(e){show('metrics',e.message)}}async function install(){if(!confirm('确认在服务器安装后端？'))return;try{let d=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(document.getElementById('instance').value),mode:'node',target_id:Number(document.getElementById('node').value)})});document.getElementById('job').value=d.job_id;show('joblog',d)}catch(e){show('joblog',e.message)}}async function job(){try{show('joblog',await api('/deployments/'+encodeURIComponent(document.getElementById('job').value)))}catch(e){show('joblog',e.message)}}setInterval(()=>{if(token())monitor()},30000)</script></html>`
+const htmlPage = `<!doctype html><html lang="zh"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Linode Node Manager Go</title><style>body{background:#0f172a;color:#e2e8f0;font:15px system-ui;max-width:1000px;margin:auto;padding:24px}section{background:#1e293b;border-radius:12px;padding:18px;margin:14px 0}input,select,button{padding:9px;margin:4px;background:#334155;color:white;border:1px solid #64748b;border-radius:7px}button{background:#2563eb;cursor:pointer}pre{white-space:pre-wrap;overflow-wrap:anywhere}table{width:100%;border-collapse:collapse}td,th{padding:8px;border-bottom:1px solid #475569}</style><h1>Linode Go 管理面板</h1><section><input type="password" id="token" placeholder="ADMIN_TOKEN"><button onclick="load()">刷新</button><p id="msg"></p></section><section><h2>服务器</h2><div id="instances"></div></section><section><h2>wp2 节点</h2><button onclick="nodes()">获取节点</button><pre id="nodes"></pre></section><section><h2>安装 XboardNode-Plus</h2><input id="instance" type="number" placeholder="Linode ID"><input id="node" type="number" placeholder="wp2 节点 ID"><button onclick="install()">安装</button><input id="job" placeholder="任务 ID"><button onclick="job()">查询任务</button><pre id="joblog"></pre></section><section><h2>CPU / 内存 / 磁盘</h2><button onclick="monitor()">刷新监控</button><pre id="metrics"></pre></section><script>const token=()=>document.getElementById('token').value;async function api(path,options={}){let r=await fetch('/api'+path,{...options,headers:{Authorization:'Bearer '+token(),'Content-Type':'application/json'}});let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function power(id,action){if(!confirm('确认对实例 '+id+' 执行 '+action+'？'))return;try{await api('/instances/'+id+'/'+action,{method:'POST'});await load()}catch(e){document.getElementById('msg').textContent=e.message}}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){try{let d=await api('/instances');document.getElementById('instances').innerHTML='<table><tr><th>ID</th><th>名称</th><th>状态</th><th>操作</th></tr>'+d.instances.map(i=>'<tr><td>'+Number(i.id)+'</td><td>'+esc(i.label)+'</td><td>'+esc(i.status)+'</td><td><button onclick="power('+Number(i.id)+',\'boot\')">开机</button><button onclick="power('+Number(i.id)+',\'shutdown\')">关机</button><button onclick="power('+Number(i.id)+',\'reboot\')">重启</button></td></tr>').join('')+'</table>';document.getElementById('msg').textContent='已加载 '+d.instances.length+' 台'}catch(e){document.getElementById('msg').textContent=e.message}}async function nodes(){try{show('nodes',(await api('/wp2/nodes')).nodes)}catch(e){show('nodes',e.message)}}async function monitor(){try{show('metrics',(await api('/monitor')).instances)}catch(e){show('metrics',e.message)}}async function install(){if(!confirm('确认在服务器安装后端？'))return;try{let d=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(document.getElementById('instance').value),mode:'node',target_id:Number(document.getElementById('node').value)})});document.getElementById('job').value=d.job_id;show('joblog',d)}catch(e){show('joblog',e.message)}}async function job(){try{show('joblog',await api('/deployments/'+encodeURIComponent(document.getElementById('job').value)))}catch(e){show('joblog',e.message)}}setInterval(()=>{if(token())monitor()},30000)</script></html>`

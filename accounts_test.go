@@ -92,3 +92,22 @@ func TestMultiAccountMonitorKeyIsolation(t *testing.T){
  s.pollAccounts(context.Background())
  if len(s.accountStatus)!=2||s.accountStatus[a.ID+"/12"].AccountID!=a.ID||s.accountStatus[b.ID+"/12"].AccountID!=b.ID{t.Fatalf("monitor snapshots conflated: %+v",s.accountStatus)}
 }
+
+func TestAccountManagementHTTP(t *testing.T){
+ t.Setenv("ADMIN_TOKEN","ci-admin")
+ t.Setenv("LINODE_TOKEN","")
+ store,err:=initAccounts(filepath.Join(t.TempDir(),"accounts.enc"),strings.Repeat("key",20));if err!=nil{t.Fatal(err)}
+ s:=testServer(http.DefaultClient);s.accounts=store;s.accountStatus=map[string]Snapshot{}
+ h:=newHandler(s)
+ added:=apiRequest(h,"POST","/api/accounts",`{"name":"test-team","token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}`)
+ if added.Code!=201||strings.Contains(added.Body.String(),"aaaaaaaaaaaaaaaaaaaa"){t.Fatalf("account creation failed or leaked token: %d %s",added.Code,added.Body.String())}
+ var account ManagedAccount
+ if err:=json.Unmarshal(added.Body.Bytes(),&account);err!=nil||account.ID==""{t.Fatalf("account ID unavailable: %v",err)}
+ if w:=apiRequest(h,"GET","/api/accounts","");w.Code!=200||!strings.Contains(w.Body.String(),"test-team"){t.Fatalf("account list failed: %d",w.Code)}
+ dup:=apiRequest(h,"POST","/api/accounts",`{"name":"test-team","token":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}`)
+ if dup.Code!=400{t.Fatalf("duplicate account accepted: %d",dup.Code)}
+ deleted:=apiRequest(h,"DELETE","/api/accounts/"+account.ID,"")
+ if deleted.Code!=200{t.Fatalf("deletion returned %d: %s",deleted.Code,deleted.Body.String())}
+ if w:=apiRequest(h,"DELETE","/api/accounts/"+account.ID,"");w.Code!=404{t.Fatalf("duplicate deletion returned %d",w.Code)}
+ if _,ok:=store.token(account.ID);ok{t.Fatal("deleted token remains in memory")}
+}

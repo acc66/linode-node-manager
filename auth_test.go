@@ -30,12 +30,12 @@ func TestPublicBrowserPasswordAuthentication(t *testing.T){
   if w.Code!=401{t.Errorf("%s unauthenticated HTTP %d",p,w.Code)}
   if p=="/"&&!strings.Contains(w.Header().Get("WWW-Authenticate"),"Basic"){t.Error("missing browser login challenge")}
  }
- for _,a:=range []string{basic("operator","wrong-password"),basic("wrong","very-strong-test-password")}{
-  if w:=authRequest(h,"GET","/api/health",a,"","");w.Code!=401{t.Errorf("wrong login HTTP %d",w.Code)}
- }
  if w:=authRequest(h,"GET","/api/health",basic("operator","very-strong-test-password"),"","");w.Code!=200{t.Fatalf("valid browser login HTTP %d %s",w.Code,w.Body.String())}
  if w:=authRequest(h,"GET","/",basic("operator","very-strong-test-password"),"","");w.Code!=200||!strings.Contains(w.Body.String(),"Linode Go"){t.Fatalf("panel HTML inaccessible after login: %d",w.Code)}
  if w:=authRequest(h,"GET","/api/health","Bearer api-token","","");w.Code!=200{t.Fatalf("legacy bearer authorization failed: %d",w.Code)}
+ for _,a:=range []string{basic("operator","wrong-password"),basic("wrong","very-strong-test-password")}{
+  if w:=authRequest(h,"GET","/api/health",a,"","");w.Code!=401{t.Errorf("wrong login HTTP %d",w.Code)}
+ }
 }
 func TestBrowserPOSTOriginProtection(t *testing.T){
  t.Setenv("ADMIN_USERNAME","operator")

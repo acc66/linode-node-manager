@@ -6,6 +6,7 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     volumes:
-      - manager-data:/data\n      - ./secrets:/run/secrets:ro
+      - manager-data:/data
+      - ./secrets:/run/secrets:ro
 volumes:
   manager-data:

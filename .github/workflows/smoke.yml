@@ -18,6 +18,17 @@ jobs:
         run: go vet ./...
       - name: Go build
         run: go build ./...
+      - name: Validate embedded dashboard JavaScript
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          src = Path('main.go').read_text()
+          html = src.split('const htmlPage = `', 1)[1].split('`', 1)[0]
+          script = html.split('<script>', 1)[1].split('</script>', 1)[0]
+          Path('/tmp/linode-dashboard.js').write_text(script)
+          PY
+          node --check /tmp/linode-dashboard.js
       - name: Build production Docker image
         run: docker build -t linode-node-manager:go .
       - name: Docker Compose smoke test (mock credentials, monitoring disabled)

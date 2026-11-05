@@ -14,11 +14,12 @@ func TestCreateInstanceAccountAndConfirmation(t *testing.T){
  account,err:=store.add("create-account",strings.Repeat("a",64));if err!=nil{t.Fatal(err)}
  calls:=0
  upstream:=newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter,r *http.Request){
+  if r.Method=="GET"&&r.URL.Path=="/v4/account/settings"{w.Write([]byte(`{"interfaces_for_new_linodes":"legacy_config_only"}`));return}
   calls++
   if r.Method!="POST"||r.URL.Path!="/v4/linode/instances"||r.Header.Get("Authorization")!="Bearer "+strings.Repeat("a",64){t.Error("incorrect create routing or credentials")}
   var data map[string]any
   if json.NewDecoder(r.Body).Decode(&data)!=nil{t.Fatal("invalid payload")}
-  if data["region"]!="us-east"||data["type"]!="g6-nanode-1"||data["image"]!="linode/debian12"||data["root_pass"]!="test-password-123!"||data["booted"]!=true||data["confirm"]!=nil{t.Errorf("unexpected creation payload fields")}
+  if data["region"]!="us-east"||data["type"]!="g6-nanode-1"||data["image"]!="linode/debian12"||data["root_pass"]!="test-password-123!"||data["booted"]!=true||data["confirm"]!=nil||data["firewall_id"]!=float64(-1)||data["interface_generation"]!="legacy_config"{t.Errorf("unexpected creation payload fields")}
   w.WriteHeader(200);w.Write([]byte(`{"id":99,"label":"new-node","status":"provisioning","ipv4":[],"root_pass":"must-not-leak"}`))
  }))
  defer upstream.Close();t.Setenv("LINODE_API_BASE_URL",upstream.URL+"/v4")
@@ -36,6 +37,7 @@ func TestCreateInstanceAccountAndConfirmation(t *testing.T){
  w:=apiRequest(h,"POST","/api/instances?account_id="+account.ID,payload)
  if w.Code!=201||!strings.Contains(w.Body.String(),`"account_id":"`+account.ID+`"`)||strings.Contains(w.Body.String(),"must-not-leak"){t.Fatalf("create result: %d %s",w.Code,w.Body.String())}
  if calls!=1{t.Fatalf("expected one creation, got %d",calls)}
+ if !s.openPortsSaved(account.ID,99){t.Fatal("all-port preference not saved")}
 }
 func TestCatalogPagination(t *testing.T){
  t.Setenv("ADMIN_TOKEN","ci-admin");t.Setenv("LINODE_TOKEN","mock")

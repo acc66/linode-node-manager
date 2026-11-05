@@ -26,7 +26,7 @@ class DeployTests(unittest.TestCase):
         protocol, _, cert = d.node_settings({'server_type': 'vless', 'server_port': 443, 'tls': 2}, '192.0.2.1')
         self.assertEqual((protocol, cert['cert_mode']), ('vless', 'none'))
 
-    def run_deployment(self, root, fail_listener=False):
+    def run_deployment(self, root, fail_listener=False, open_all=False, ufw=False):
         files = Path(root)
         bindir = files / 'bin'
         bindir.mkdir(exist_ok=True)
@@ -34,11 +34,11 @@ class DeployTests(unittest.TestCase):
         node_root = files / 'config'
         content = b'mock-release-binary'
         assets = {'amd64': {name: hashlib.sha256(content).hexdigest() for name in ['xboard-node', 'xbctl']}}
-        payload = {'panel': 'https://wp2.example', 'token': 'private-token', 'node_id': 929, 'ip': '192.0.2.1'}
+        payload = {'panel': 'https://wp2.example', 'token': 'private-token', 'node_id': 929, 'ip': '192.0.2.1', 'open_all_ports': open_all}
         commands = []
         def command(*args, check=True):
             commands.append(args)
-            output = '123' if 'MainPID' in str(args) else ''
+            output = '123' if 'MainPID' in str(args) else ('Status: active' if args == ('ufw', 'status') else '')
             return subprocess.CompletedProcess(args, 0, stdout=output)
         config = {'server_type': 'shadowsocks', 'server_port': 10001}
         opener = unittest.mock.Mock()
@@ -51,7 +51,7 @@ class DeployTests(unittest.TestCase):
              patch.object(Path, 'is_dir', is_dir), patch.object(d.urllib.request, 'build_opener', return_value=opener), \
              patch.object(d.urllib.request, 'urlopen', side_effect=lambda *a, **kw: io.BytesIO(content)), \
              patch.object(d, 'command', side_effect=command), patch.object(d, 'node_listening', return_value=not fail_listener), \
-             patch.object(d.time, 'sleep'), patch.object(d.shutil, 'which', return_value=None):
+             patch.object(d.time, 'sleep'), patch.object(d.shutil, 'which', return_value='/usr/sbin/ufw' if ufw else None):
             if fail_listener:
                 with self.assertRaisesRegex(ValueError, '超时'):
                     d.deploy(payload)
@@ -72,6 +72,22 @@ class DeployTests(unittest.TestCase):
             self.run_deployment(tmp, fail_listener=True)
             self.assertEqual(config.read_bytes(), original_config)
             self.assertEqual((bindir / 'xboard-node').read_bytes(), original_binary)
+
+    def test_all_ports_only_when_enabled(self):
+        for enabled in [False, True]:
+            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temp:
+                _, _, _, commands = self.run_deployment(temp, open_all=enabled, ufw=True)
+                rule = ('ufw', 'insert', '1', 'allow', 'in', 'from', 'any', 'to', 'any')
+                self.assertEqual(rule in commands, enabled)
+
+    def test_dns_wait_after_update(self):
+        config = {'server_type': 'hysteria2', 'server_port': 443, 'server_name': 'node.example.com'}
+        wrong = [(2, 1, 6, '', ('192.0.2.2', 80))]
+        correct = [(2, 1, 6, '', ('192.0.2.1', 80))]
+        with patch.object(d.socket, 'getaddrinfo', side_effect=[wrong, correct]), patch.object(d.time, 'sleep') as sleep:
+            _, _, cert = d.node_settings(config, '192.0.2.1', wait_dns=True)
+            self.assertEqual(cert['cert_mode'], 'http')
+            sleep.assert_called_once_with(10)
 
 
 if __name__ == '__main__':

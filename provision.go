@@ -38,6 +38,7 @@ func (s *Server) createInstance(w http.ResponseWriter,r *http.Request){
   Image string `json:"image"`
   RootPass string `json:"root_pass"`
   Confirm bool `json:"confirm"`
+  OpenAllPorts *bool `json:"open_all_ports"`
  }
  dec:=json.NewDecoder(http.MaxBytesReader(w,r.Body,16<<10));dec.DisallowUnknownFields()
  if err:=dec.Decode(&in);err!=nil{fail(w,400,"Invalid create request");return}
@@ -47,7 +48,10 @@ func (s *Server) createInstance(w http.ResponseWriter,r *http.Request){
  if len(in.Label)<3||len(in.Label)>64||in.Region==""||in.Type==""||in.Image==""{fail(w,400,"Label (3-64 characters), region, type and image are required");return}
  if len(in.RootPass)<12||len(in.RootPass)>128{fail(w,400,"Root password must be 12-128 characters; Linode also checks password strength");return}
  if s.credentials==nil{fail(w,503,"Configure ACCOUNT_ENCRYPTION_KEY before creating instances so root passwords can be saved encrypted");return}
- payload,_:=json.Marshal(map[string]any{"label":in.Label,"region":in.Region,"type":in.Type,"image":in.Image,"root_pass":in.RootPass,"booted":true})
+ openAll:=in.OpenAllPorts==nil||*in.OpenAllPorts
+ data:=map[string]any{"label":in.Label,"region":in.Region,"type":in.Type,"image":in.Image,"root_pass":in.RootPass,"booted":true}
+ if openAll{if err:=s.openNetworkConfig(r.Context(),account,data);err!=nil{fail(w,502,err.Error());return}}
+ payload,_:=json.Marshal(data)
  b,status,err:=s.linodeFor(r.Context(),account,"POST","/linode/instances",bytes.NewReader(payload))
  if err!=nil{fail(w,502,"Creation result unknown. Refresh the instance list before retrying to avoid duplicate billing.");return}
  if status!=200&&status!=201{
@@ -57,7 +61,9 @@ func (s *Server) createInstance(w http.ResponseWriter,r *http.Request){
  var inst Instance
  if json.Unmarshal(b,&inst)!=nil||inst.ID<=0{fail(w,502,"Creation result unknown. Refresh the instance list before retrying.");return}
  inst.AccountID=account
+ inst.OpenAllPorts=openAll
  warning:=""
  if err:=s.saveRootPassword(account,inst.ID,inst.Label,in.RootPass);err!=nil{warning="Instance created, but saving its password failed. Keep the password you entered; do not create again."}else{inst.PasswordSaved=true}
+ if openAll{if err:=s.saveRootPassword("open-ports-"+account,inst.ID,inst.Label,"true");err!=nil{warning+=" 服务器已创建并且云防火墙不绑定，但全端口配置状态未保存。"}}
  send(w,201,struct{Instance;Warning string `json:"warning,omitempty"`}{inst,warning})
 }

@@ -31,7 +31,7 @@ def command(*args, check=True):
                           stderr=subprocess.STDOUT, text=True, timeout=240)
 
 
-def node_settings(config, ip, ipv6=''):
+def node_settings(config, ip, ipv6='', wait_dns=False):
     protocol = str(config.get('server_type') or config.get('protocol') or '').lower()
     if protocol == 'v2ray':
         protocol = 'vmess'
@@ -54,12 +54,24 @@ def node_settings(config, ip, ipv6=''):
                 raise ValueError('TLS 节点没有有效域名，请先在 wp2 节点配置域名')
         else:
             raise ValueError('自动申请证书需要节点域名，不能使用 IP 或自动退回自签名证书')
-        addresses = {item[4][0] for item in socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)}
         allowed = {ip}
         if ipv6:
             allowed.add(ipv6.split('/')[0])
-        if not addresses or not addresses <= allowed or ip not in addresses:
-            raise ValueError('节点域名 A/AAAA 未全部指向当前实例，请先完成 DNS 解析')
+        deadline = time.monotonic() + (600 if wait_dns else 0)
+        announced = False
+        while True:
+            try:
+                addresses = {item[4][0] for item in socket.getaddrinfo(domain, 80, type=socket.SOCK_STREAM)}
+            except socket.gaierror:
+                addresses = set()
+            if addresses and addresses <= allowed and ip in addresses:
+                break
+            if time.monotonic() >= deadline:
+                raise ValueError('节点域名 A/AAAA 未全部指向当前实例或 DNS 缓存尚未过期，请稍后重试')
+            if not announced:
+                print('DNS 记录已更新，等待目标服务器解析缓存生效（最多10分钟）…', flush=True)
+                announced = True
+            time.sleep(10)
         cert = {'cert_mode': 'http', 'auto_tls': True, 'domain': domain,
                 'http_port': 80, 'cert_dir': str(ROOT / 'certs')}
     return protocol, port, cert
@@ -107,7 +119,7 @@ def deploy(payload):
         if len(data) > 4 * 1024 * 1024:
             raise ValueError('wp2 节点配置响应过大')
         config = json.loads(data)
-    protocol, port, cert = node_settings(config, payload['ip'], payload.get('ipv6', ''))
+    protocol, port, cert = node_settings(config, payload['ip'], payload.get('ipv6', ''), payload.get('dns_wait', False))
     print('节点配置验证通过，协议：%s，端口：%s，证书模式：%s' % (protocol, port, cert['cert_mode']), flush=True)
     binding = {'panel': payload['panel'], 'node_id': payload['node_id']}
     marker = ROOT / 'manager-binding.json'
@@ -177,6 +189,10 @@ WantedBy=multi-user.target
         if shutil.which('ufw'):
             status = command('ufw', 'status', check=False).stdout
             if 'Status: active' in status:
+                if payload.get('open_all_ports', False):
+                    command('ufw', 'insert', '1', 'allow', 'in', 'from', 'any', 'to', 'any')
+                    command('ufw', 'insert', '1', 'allow', 'out', 'from', 'any', 'to', 'any')
+                    print('已按创建设置放行本机 UFW 全部入站/出站端口。', flush=True)
                 transport = 'udp' if protocol in ['hysteria', 'hysteria2', 'tuic'] else 'tcp'
                 command('ufw', 'allow', '%d/%s' % (port, transport))
                 if cert['cert_mode'] == 'http':

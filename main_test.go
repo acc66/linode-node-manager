@@ -26,7 +26,7 @@ func TestAuth(t *testing.T) {
 }
 func TestShellQuote(t *testing.T){
  v:=shellQuote("foo'bar")
- if v!="'foo'\\''bar'"{t.Fatalf("unexpected quoted string: %q",v)}
+ if v!="'foo'\"'\"'bar'"{t.Fatalf("unexpected quoted string: %q",v)}
 }
 func TestPublicIP(t *testing.T){
  cases:=[]struct{ips []string;want string}{

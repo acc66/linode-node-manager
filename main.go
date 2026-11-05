@@ -24,11 +24,14 @@ type Server struct {
  client *http.Client
  mu sync.RWMutex
  status map[int]Snapshot
+ accountStatus map[string]Snapshot
+ accounts *accountStore
  jobs map[string]Job
  failedAuth map[string]loginAttempt
  sshRun func(context.Context,string,string)(string,error)
 }
 type Snapshot struct {
+ AccountID string `json:"account_id,omitempty"`
  ID int `json:"id"`
  Label string `json:"label"`
  State string `json:"status"`
@@ -42,11 +45,13 @@ type Snapshot struct {
  Updated string `json:"updated_at"`
 }
 type Job struct {
+ AccountID string `json:"account_id,omitempty"`
  ID string `json:"job_id"`
  Status string `json:"status"`
  Log string `json:"log"`
 }
 type Instance struct {
+ AccountID string `json:"account_id,omitempty"`
  ID int `json:"id"`
  Label string `json:"label"`
  Status string `json:"status"`
@@ -110,19 +115,16 @@ func (s *Server) request(ctx context.Context,method,endpoint,token string,payloa
  resp,e:=s.client.Do(req);if e!=nil{return nil,0,e};defer resp.Body.Close()
  b,e:=io.ReadAll(io.LimitReader(resp.Body,4<<20));return b,resp.StatusCode,e
 }
-func (s *Server) linode(ctx context.Context,method,path string,payload io.Reader)([]byte,int,error){
- token:=os.Getenv("LINODE_TOKEN");if token==""{return nil,503,errors.New("LINODE_TOKEN not configured")}
- base:=env("LINODE_API_BASE_URL","https://api.linode.com/v4")
- return s.request(ctx,method,strings.TrimRight(base,"/")+path,token,payload)
-}
-func (s *Server) instances(ctx context.Context)([]Instance,error){
+func (s *Server) linode(ctx context.Context,method,path string,payload io.Reader)([]byte,int,error){return s.linodeFor(ctx,"",method,path,payload)}
+func (s *Server) instances(ctx context.Context)([]Instance,error){return s.instancesFor(ctx,"")}
+func (s *Server) instancesFor(ctx context.Context,accountID string)([]Instance,error){
  out:=[]Instance{}
  for page:=1;page<=100;page++{
-  b,status,e:=s.linode(ctx,"GET",fmt.Sprintf("/linode/instances?page=%d&page_size=100",page),nil)
+  b,status,e:=s.linodeFor(ctx,accountID,"GET",fmt.Sprintf("/linode/instances?page=%d&page_size=100",page),nil)
   if e!=nil{return nil,e};if status!=200{return nil,fmt.Errorf("Linode HTTP %d",status)}
   var data struct{Data []Instance `json:"data"`;Pages int `json:"pages"`}
   if e=json.Unmarshal(b,&data);e!=nil{return nil,e}
-  out=append(out,data.Data...);if page>=data.Pages{break}
+  for _,inst:=range data.Data{inst.AccountID=accountID;if inst.AccountID==""{inst.AccountID="legacy"};out=append(out,inst)};if page>=data.Pages{break}
  }
  return out,nil
 }
@@ -190,7 +192,7 @@ func (s *Server) poll(ctx context.Context){
  items,e:=s.instances(ctx);if e!=nil{log.Printf("monitor: Linode list unavailable: %v",e);return}
  for _,inst:=range items{
   old:=Snapshot{};s.mu.RLock();old=s.status[inst.ID];s.mu.RUnlock()
-  next:=Snapshot{ID:inst.ID,Label:inst.Label,State:"offline",Updated:time.Now().UTC().Format(time.RFC3339)}
+  next:=Snapshot{AccountID:"legacy",ID:inst.ID,Label:inst.Label,State:"offline",Updated:time.Now().UTC().Format(time.RFC3339)}
   if inst.Status=="running"&&publicIP(inst)!=""{
    c,cancel:=context.WithTimeout(ctx,20*time.Second);output,err:=s.runSSH(c,publicIP(inst),probeScript);cancel()
    if err==nil{
@@ -210,18 +212,20 @@ func (s *Server) poll(ctx context.Context){
 }
 func (s *Server) monitoring(ctx context.Context){
  ticker:=time.NewTicker(time.Duration(max(30,number("MONITOR_INTERVAL",60)))*time.Second);defer ticker.Stop()
- s.poll(ctx);for{select{case <-ctx.Done():return;case <-ticker.C:s.poll(ctx)}}
+ s.poll(ctx);s.pollAccounts(ctx);for{select{case <-ctx.Done():return;case <-ticker.C:s.poll(ctx);s.pollAccounts(ctx)}}
 }
 func (s *Server) install(w http.ResponseWriter,r *http.Request){
+ accountID:=r.URL.Query().Get("account_id")
+ if _,err:=s.accountToken(accountID);err!=nil{fail(w,400,"Unknown or unconfigured Linode account");return}
  var in struct{InstanceID int `json:"instance_id"`;Mode string `json:"mode"`;TargetID int `json:"target_id"`}
  if json.NewDecoder(io.LimitReader(r.Body,1<<16)).Decode(&in)!=nil||in.InstanceID<=0||in.TargetID<=0||in.Mode!="node"{fail(w,400,"Valid instance_id, node mode and target_id required");return}
  token:=os.Getenv("WP2_API_TOKEN");base:=env("WP2_BASE_URL","");u,e:=url.Parse(base);if token==""||e!=nil||u.Scheme!="https"||u.Host==""{fail(w,503,"wp2 not configured");return}
- b,st,e:=s.linode(r.Context(),"GET",fmt.Sprintf("/linode/instances/%d",in.InstanceID),nil);if e!=nil||st!=200{fail(w,502,"Linode instance lookup failed");return}
+ b,st,e:=s.linodeFor(r.Context(),accountID,"GET",fmt.Sprintf("/linode/instances/%d",in.InstanceID),nil);if e!=nil||st!=200{fail(w,502,"Linode instance lookup failed");return}
  var inst Instance;if json.Unmarshal(b,&inst)!=nil||inst.Status!="running"||publicIP(inst)==""{fail(w,409,"Running public IPv4 instance required");return}
  id:=strconv.FormatInt(time.Now().UnixNano(),36)
- s.mu.Lock();s.jobs[id]=Job{ID:id,Status:"queued"};s.mu.Unlock()
+ s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,Status:"queued"};s.mu.Unlock()
  go func(){
-  s.mu.Lock();s.jobs[id]=Job{ID:id,Status:"running"};s.mu.Unlock()
+  s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,Status:"running"};s.mu.Unlock()
   ctx,cancel:=context.WithTimeout(context.Background(),15*time.Minute);defer cancel()
   // Use remote bash stdin to avoid placing the token in the ssh command line.
   script:="set -e\ncurl -fsSL https://raw.githubusercontent.com/acc66/XboardNode-Plus/main/install.sh -o /tmp/xboard-install.sh\nbash /tmp/xboard-install.sh --mode node --panel "+shellQuote(base)+" --token "+shellQuote(token)+" --node-id "+strconv.Itoa(in.TargetID)+"\n"
@@ -229,7 +233,7 @@ func (s *Server) install(w http.ResponseWriter,r *http.Request){
   output=strings.ReplaceAll(output,token,"[REDACTED]")
   if len(output)>12000{output=output[len(output)-12000:]}
   state:="success";if err!=nil{state="failed";output+="\nInstallation failed"}
-  s.mu.Lock();s.jobs[id]=Job{ID:id,Status:state,Log:output};s.mu.Unlock()
+  s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,Status:state,Log:output};s.mu.Unlock()
  }()
  send(w,202,map[string]string{"job_id":id,"status":"queued"})
 }
@@ -238,17 +242,35 @@ func newHandler(s *Server) http.Handler {
  mux:=http.NewServeMux()
  mux.HandleFunc("GET /",s.auth(func(w http.ResponseWriter,r *http.Request){w.Header().Set("Content-Type","text/html; charset=utf-8");io.WriteString(w,htmlPage)}))
  mux.HandleFunc("GET /api/health",s.auth(func(w http.ResponseWriter,r *http.Request){send(w,200,map[string]string{"status":"ok","language":"go"})}))
- mux.HandleFunc("GET /api/instances",s.auth(func(w http.ResponseWriter,r *http.Request){items,e:=s.instances(r.Context());if e!=nil{fail(w,502,"Linode API unavailable");return};send(w,200,map[string]any{"instances":items})}))
- mux.HandleFunc("GET /api/instances/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));if e!=nil||id<=0{fail(w,400,"Invalid instance ID");return};b,st,e:=s.linode(r.Context(),"GET",fmt.Sprintf("/linode/instances/%d",id),nil);if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
+ mux.HandleFunc("GET /api/instances",s.auth(func(w http.ResponseWriter,r *http.Request){
+  accountID:=r.URL.Query().Get("account_id")
+  items:=[]Instance{}
+  ids:=[]string{}
+  if accountID!=""{if _,err:=s.accountToken(accountID);err!=nil{fail(w,400,"Unknown account");return};ids=append(ids,accountID)}else{
+   if os.Getenv("LINODE_TOKEN")!=""{ids=append(ids,"legacy")}
+   if s.accounts!=nil{for _,a:=range s.accounts.list(){ids=append(ids,a.ID)}}
+  }
+  for _,id:=range ids{found,err:=s.instancesFor(r.Context(),id);if err!=nil{fail(w,502,"Linode API unavailable for selected account");return};items=append(items,found...)}
+  send(w,200,map[string]any{"instances":items})
+ }))
+ mux.HandleFunc("GET /api/instances/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));if e!=nil||id<=0{fail(w,400,"Invalid instance ID");return};b,st,e:=s.linodeFor(r.Context(),r.URL.Query().Get("account_id"),"GET",fmt.Sprintf("/linode/instances/%d",id),nil);if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
  mux.HandleFunc("GET /api/wp2/nodes",s.auth(s.wpNodes))
- mux.HandleFunc("GET /api/monitor",s.auth(func(w http.ResponseWriter,r *http.Request){s.mu.RLock();defer s.mu.RUnlock();items:=[]Snapshot{};for _,v:=range s.status{items=append(items,v)};send(w,200,map[string]any{"instances":items})}))
+ mux.HandleFunc("GET /api/accounts",s.auth(s.accountsAPI))
+ mux.HandleFunc("POST /api/accounts",s.auth(s.accountsAPI))
+ mux.HandleFunc("DELETE /api/accounts/{id}",s.auth(s.deleteAccount))
+ mux.HandleFunc("GET /api/monitor",s.auth(func(w http.ResponseWriter,r *http.Request){s.mu.RLock();defer s.mu.RUnlock();items:=[]Snapshot{};for _,v:=range s.status{items=append(items,v)};for _,v:=range s.accountStatus{items=append(items,v)};send(w,200,map[string]any{"instances":items})}))
  mux.HandleFunc("POST /api/deployments/install",s.auth(s.install))
  mux.HandleFunc("GET /api/deployments/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){s.mu.RLock();v,ok:=s.jobs[r.PathValue("id")];s.mu.RUnlock();if !ok{fail(w,404,"Unknown job");return};send(w,200,v)}))
- mux.HandleFunc("POST /api/instances/{id}/{action}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));action:=r.PathValue("action");if e!=nil||id<=0||(action!="boot"&&action!="shutdown"&&action!="reboot"){fail(w,400,"Invalid action");return};b,st,e:=s.linode(r.Context(),"POST",fmt.Sprintf("/linode/instances/%d/%s",id,action),strings.NewReader("{}"));if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
+ mux.HandleFunc("POST /api/instances/{id}/{action}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));action:=r.PathValue("action");if e!=nil||id<=0||(action!="boot"&&action!="shutdown"&&action!="reboot"){fail(w,400,"Invalid action");return};b,st,e:=s.linodeFor(r.Context(),r.URL.Query().Get("account_id"),"POST",fmt.Sprintf("/linode/instances/%d/%s",id,action),strings.NewReader("{}"));if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
  return mux
 }
 func main(){
- s:=&Server{client:&http.Client{Timeout:35*time.Second,CheckRedirect:func(_ *http.Request,_ []*http.Request)error{return http.ErrUseLastResponse}},status:map[int]Snapshot{},jobs:map[string]Job{}}
+ s:=&Server{client:&http.Client{Timeout:35*time.Second,CheckRedirect:func(_ *http.Request,_ []*http.Request)error{return http.ErrUseLastResponse}},status:map[int]Snapshot{},accountStatus:map[string]Snapshot{},jobs:map[string]Job{}}
+ if key:=os.Getenv("ACCOUNT_ENCRYPTION_KEY");key!=""{
+  store,err:=initAccounts(env("ACCOUNTS_FILE","/data/accounts.enc"),key)
+  if err!=nil{log.Fatal("Cannot load encrypted accounts: ",err)}
+  s.accounts=store
+ }
 
  mux:=newHandler(s)
  ctx,cancel:=context.WithCancel(context.Background());defer cancel()

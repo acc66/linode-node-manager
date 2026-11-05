@@ -1,0 +1,26 @@
+name: Python smoke tests
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install -r requirements.txt
+      - run: python -m compileall -q app.py deploy.py monitor.py wp2.py
+      - name: Import application and verify routes
+        run: |
+          python - <<'PY'
+          from app import app
+          paths={r.path for r in app.routes}
+          for p in ('/','/api/instances','/api/monitor','/api/wp2/nodes','/api/deployments/install'):
+              assert p in paths,p
+          print('Application imports and expected routes registered')
+          PY
+      - name: Docker build
+        run: docker build -t linode-node-manager:smoke .

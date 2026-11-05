@@ -175,7 +175,7 @@ func (s *Server) install(w http.ResponseWriter,r *http.Request){
  }()
  send(w,202,map[string]string{"job_id":id,"status":"queued"})
 }
-func shellQuote(s string)string{return "'"+strings.ReplaceAll(s,"'","'\''")+"'"}
+func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func main(){
  s:=&Server{client:&http.Client{Timeout:35*time.Second,CheckRedirect:func(_ *http.Request,_ []*http.Request)error{return http.ErrUseLastResponse}},status:map[int]Snapshot{},jobs:map[string]Job{}}
  mux:=http.NewServeMux()

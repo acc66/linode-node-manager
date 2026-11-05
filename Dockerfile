@@ -1,8 +1,10 @@
-FROM python:3.12-slim
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
-COPY app.py deploy.py monitor.py wp2.py ./
-RUN mkdir -p /data
+FROM golang:1.23-alpine AS build
+WORKDIR /src
+COPY go.mod main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags='-s -w' -o /linode-node-manager .
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates openssh-client bash python3
+COPY --from=build /linode-node-manager /usr/local/bin/linode-node-manager
+RUN mkdir -p /data /run/secrets
 EXPOSE 8000
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["/usr/local/bin/linode-node-manager"]

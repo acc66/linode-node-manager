@@ -63,3 +63,27 @@ jobs:
           bad=$(curl -ksS -o /dev/null -w '%{http_code}' -u ci-operator:wrong-password https://localhost/api/health)
           test "$bad" = "401"
           echo "Public HTTPS and browser password authentication passed"
+      - name: Compile Linux amd64 and arm64 release bundles
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            mkdir -p "dist/stage-${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/stage-${arch}/linode-node-manager" .
+            cp compose.yml Caddyfile .env.example README.md "dist/stage-${arch}/"
+            tar -czf "dist/linode-node-manager-linux-${arch}.tar.gz" -C "dist/stage-${arch}" .
+            rm -rf "dist/stage-${arch}"
+          done
+          tar -czf dist/linode-node-manager-docker-source.tar.gz --exclude=.git --exclude=.env --exclude=secrets --exclude=dist --exclude=linode-node-manager --exclude='*.pem' --exclude='*.key' -C . .
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+          ls -lh dist/*.tar.gz dist/SHA256SUMS
+      - name: Upload downloadable build packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: linode-node-manager-linux-builds
+          path: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

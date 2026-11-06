@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 import socket
 import ssl
@@ -177,6 +178,32 @@ def port_hop_script(rules):
     return '\n'.join(lines) + '\n'
 
 
+def merge_existing_port_hops(script_path, new_rules):
+    """Keep current node hopping rules when adding another node to the backend."""
+    if not script_path.exists():
+        return list(new_rules)
+    content = script_path.read_text()
+    pattern = re.compile(r'--dport (\d+)(?::(\d+))? -j REDIRECT --to-ports (\d+)')
+    existing = [(int(start), int(end or start), int(target))
+                for start, end, target in pattern.findall(content)]
+    if not existing and content.strip():
+        raise ValueError('现有 Hysteria2 端口跳跃规则无法识别，未覆盖已有配置')
+    for start, end, _ in new_rules:
+        for old_start, old_end, _ in existing:
+            if start <= old_end and old_start <= end:
+                raise ValueError('新增 Hysteria2 跳跃端口与现有规则重叠：%d-%d' % (start, end))
+    return existing + list(new_rules)
+
+
+def ensure_add_nodes_available(previous_entries, panel, prepared):
+    existing = {int(entry.get('panel', {}).get('node_id', 0) or 0)
+                for entry in previous_entries
+                if str(entry.get('panel', {}).get('url', '')).rstrip('/') == panel.rstrip('/')}
+    duplicates = sorted(existing.intersection(item['node_id'] for item in prepared))
+    if duplicates:
+        raise ValueError('这些节点已安装：%s；如需覆盖，请使用“重装所选节点”' % ', '.join(map(str, duplicates)))
+
+
 def remove_port_hop_rules():
     command('iptables', '-t', 'nat', '-D', 'PREROUTING', '-j', 'LNM-HY2-HOP', check=False)
     command('iptables', '-t', 'nat', '-F', 'LNM-HY2-HOP', check=False)
@@ -275,6 +302,12 @@ def deploy(payload):
     else:
         global_settings = {'kernel': {'type': 'auto', 'config_dir': str(ROOT)}, 'log': {'level': 'info'}}
 
+    operation = payload.get('operation') or 'add'
+    if operation == 'add':
+        ensure_add_nodes_available(previous_entries, payload['panel'], prepared)
+    elif operation != 'replace':
+        raise ValueError('节点操作方式无效')
+
     # Keep existing node bindings and replace only the IDs explicitly selected.
     for item in prepared:
         node_id = item['node_id']
@@ -317,6 +350,8 @@ def deploy(payload):
     was_hop_enabled = command('systemctl', 'is-enabled', 'xboard-node-port-hops.service', check=False).returncode == 0
     mutated = False
     hop_rules = [(start, end, item['port']) for item in prepared for start, end in item['hops']]
+    if operation == 'add':
+        hop_rules = merge_existing_port_hops(PORT_HOP_SCRIPT, hop_rules)
     if hop_rules:
         ensure_iptables()
     try:
@@ -403,7 +438,7 @@ WantedBy=multi-user.target
             command('systemctl', 'enable', '--now', 'xboard-node-port-hops.service')
             command(str(PORT_HOP_SCRIPT))
             print('Hysteria2 UDP 端口跳跃规则已设置并启用开机恢复。', flush=True)
-        elif PORT_HOP_UNIT.exists() or PORT_HOP_SCRIPT.exists():
+        elif (PORT_HOP_UNIT.exists() or PORT_HOP_SCRIPT.exists()) and operation != 'add':
             if not previous_binding:
                 raise ValueError('发现非面板管理的端口跳跃服务，自动安装不会覆盖')
             command('systemctl', 'disable', '--now', 'xboard-node-port-hops.service', check=False)

@@ -204,6 +204,11 @@ def ensure_add_nodes_available(previous_entries, panel, prepared):
         raise ValueError('这些节点已安装：%s；如需覆盖，请使用“重装所选节点”' % ', '.join(map(str, duplicates)))
 
 
+def node_config_dir(panel_url, node_id):
+    panel_key = hashlib.sha256(panel_url.rstrip('/').lower().encode()).hexdigest()[:12]
+    return ROOT / 'nodes' / panel_key / str(node_id)
+
+
 def remove_port_hop_rules():
     command('iptables', '-t', 'nat', '-D', 'PREROUTING', '-j', 'LNM-HY2-HOP', check=False)
     command('iptables', '-t', 'nat', '-F', 'LNM-HY2-HOP', check=False)
@@ -308,11 +313,23 @@ def deploy(payload):
     elif operation != 'replace':
         raise ValueError('节点操作方式无效')
 
+    # XboardNode-Plus/vless-ban requires a private kernel config directory per
+    # node instance. Older panel versions wrote ROOT for every node, which
+    # makes the newer multi-instance layout validator refuse to start.
+    for old_entry in previous_entries:
+        old_node_id = int(old_entry.get('panel', {}).get('node_id', 0) or 0)
+        if old_node_id > 0:
+            old_kernel = old_entry.get('kernel')
+            if not isinstance(old_kernel, dict):
+                old_kernel = {}
+                old_entry['kernel'] = old_kernel
+            old_kernel['config_dir'] = str(node_config_dir(payload['panel'], old_node_id))
+
     # Keep existing node bindings and replace only the IDs explicitly selected.
     for item in prepared:
         node_id = item['node_id']
         entry = {'panel': {'url': payload['panel'], 'token': payload['token'], 'node_id': node_id},
-                 'kernel': {'type': 'auto', 'config_dir': str(ROOT)}, 'log': {'level': 'info'}}
+                 'kernel': {'type': 'auto', 'config_dir': str(node_config_dir(payload['panel'], node_id))}, 'log': {'level': 'info'}}
         if item['cert']['cert_mode'] != 'none':
             entry['cert'] = item['cert']
         if item['guard']:

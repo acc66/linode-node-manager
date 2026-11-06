@@ -131,12 +131,11 @@ class DeployTests(unittest.TestCase):
             self.assertEqual(config.read_bytes(), original_config)
             self.assertEqual((bindir / 'xboard-node').read_bytes(), original_binary)
 
-    def test_all_ports_only_when_enabled(self):
-        for enabled in [False, True]:
-            with self.subTest(enabled=enabled), tempfile.TemporaryDirectory() as temp:
-                _, _, _, commands = self.run_deployment(temp, open_all=enabled, ufw=True)
-                rule = ('ufw', 'insert', '1', 'allow', 'in', 'from', 'any', 'to', 'any')
-                self.assertEqual(rule in commands, enabled)
+    def test_backend_install_does_not_apply_all_port_rules(self):
+        with tempfile.TemporaryDirectory() as temp:
+            _, _, _, commands = self.run_deployment(temp, open_all=True, ufw=True)
+            self.assertFalse(any(args[:3] == ('ufw', 'insert', '1') for args in commands))
+            self.assertTrue(any(args[:2] == ('ufw', 'allow') for args in commands))
 
     def test_dns_wait_after_update(self):
         config = {'server_type': 'hysteria2', 'server_port': 443, 'server_name': 'node.example.com'}

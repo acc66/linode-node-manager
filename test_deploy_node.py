@@ -43,6 +43,27 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(d.release_assets('vless', 'amd64')[0], 'acc66/vless-ban')
         self.assertEqual(d.release_assets('hysteria2', 'amd64')[0], 'acc66/XboardNode-Plus')
 
+    def test_missing_iptables_is_installed_with_detected_package_manager(self):
+        calls = []
+        installed = {'iptables': False}
+        def which(name):
+            if name == 'iptables':
+                return '/usr/sbin/iptables' if installed['iptables'] else None
+            return '/usr/bin/apt-get' if name == 'apt-get' else None
+        def run(*args, **kwargs):
+            calls.append(args)
+            if args[:2] == ('apt-get', 'install'):
+                installed['iptables'] = True
+            return subprocess.CompletedProcess(args, 0, stdout='')
+        with patch.object(d.shutil, 'which', side_effect=which), patch.object(d, 'command', side_effect=run):
+            d.ensure_iptables()
+        self.assertEqual(calls, [('apt-get', 'update'), ('apt-get', 'install', '-y', 'iptables')])
+
+    def test_missing_iptables_without_package_manager_has_actionable_error(self):
+        with patch.object(d.shutil, 'which', return_value=None):
+            with self.assertRaisesRegex(ValueError, '请安装 iptables 后重试'):
+                d.ensure_iptables()
+
     def run_deployment(self, root, fail_listener=False, open_all=False, ufw=False, node_ids=None, config=None):
         files = Path(root)
         bindir = files / 'bin'

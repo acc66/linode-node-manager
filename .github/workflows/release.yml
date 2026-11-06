@@ -1,0 +1,49 @@
+name: Publish GitHub Release
+on:
+  create:
+permissions:
+  contents: write
+jobs:
+  release:
+    if: github.event.ref_type == 'branch' && startsWith(github.event.ref, 'release/')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Build Linux amd64 and arm64 packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            mkdir -p "dist/stage-${arch}"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags="-s -w" -o "dist/stage-${arch}/linode-node-manager" .
+            cp compose.yml Caddyfile .env.example README.md "dist/stage-${arch}/"
+            tar -czf "dist/linode-node-manager-linux-${arch}.tar.gz" -C "dist/stage-${arch}" .
+            rm -rf "dist/stage-${arch}"
+          done
+          tar -czf dist/linode-node-manager-docker-source.tar.gz --exclude=.git --exclude=.env --exclude=secrets --exclude=dist --exclude=linode-node-manager --exclude='*.pem' --exclude='*.key' -C . .
+          (cd dist && sha256sum *.tar.gz > SHA256SUMS)
+      - name: Publish versioned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#release/}"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Invalid release branch name: $GITHUB_REF_NAME (expected release/vX.Y.Z)" >&2
+            exit 1
+          fi
+          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS \
+            --target "$GITHUB_SHA" --title "$tag" --generate-notes
+      - name: Remove temporary release branch
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/heads/$GITHUB_REF_NAME"

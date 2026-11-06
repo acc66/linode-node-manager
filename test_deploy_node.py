@@ -43,6 +43,19 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(d.release_assets('vless', 'amd64')[0], 'acc66/vless-ban')
         self.assertEqual(d.release_assets('hysteria2', 'amd64')[0], 'acc66/XboardNode-Plus')
 
+    def test_add_nodes_rejects_duplicates_and_merges_hopping_rules(self):
+        entry = {'panel': {'url': 'https://wp2.example/', 'node_id': 929}}
+        with self.assertRaisesRegex(ValueError, '已安装'):
+            d.ensure_add_nodes_available([entry], 'https://wp2.example', [{'node_id': 929}])
+        d.ensure_add_nodes_available([entry], 'https://wp2.other', [{'node_id': 929}])
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / 'hops'
+            script.write_text(d.port_hop_script([(444, 8443, 443)]))
+            self.assertEqual(d.merge_existing_port_hops(script, [(12000, 13000, 2086)]),
+                             [(444, 8443, 443), (12000, 13000, 2086)])
+            with self.assertRaisesRegex(ValueError, '重叠'):
+                d.merge_existing_port_hops(script, [(443, 500, 2086)])
+
     def test_missing_iptables_is_installed_with_detected_package_manager(self):
         calls = []
         installed = {'iptables': False}
@@ -64,7 +77,7 @@ class DeployTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, '请安装 iptables 后重试'):
                 d.ensure_iptables()
 
-    def run_deployment(self, root, fail_listener=False, open_all=False, ufw=False, node_ids=None, config=None):
+    def run_deployment(self, root, fail_listener=False, open_all=False, ufw=False, node_ids=None, config=None, operation='replace'):
         files = Path(root)
         bindir = files / 'bin'
         bindir.mkdir(exist_ok=True)
@@ -72,7 +85,7 @@ class DeployTests(unittest.TestCase):
         node_root = files / 'config'
         content = b'mock-release-binary'
         assets = {'amd64': {name: hashlib.sha256(content).hexdigest() for name in ['xboard-node', 'xbctl']}}
-        payload = {'panel': 'https://wp2.example', 'token': 'private-token', 'node_ids': node_ids or [929], 'ip': '192.0.2.1', 'open_all_ports': open_all}
+        payload = {'panel': 'https://wp2.example', 'token': 'private-token', 'node_ids': node_ids or [929], 'operation': operation, 'ip': '192.0.2.1', 'open_all_ports': open_all}
         commands = []
         def command(*args, check=True):
             commands.append(args)
@@ -84,7 +97,7 @@ class DeployTests(unittest.TestCase):
         original_is_dir = Path.is_dir
         def is_dir(path):
             return True if str(path) == '/run/systemd/system' else original_is_dir(path)
-        with patch.object(d, 'ROOT', node_root), patch.object(d, 'UNIT', unit), patch.object(d, 'BINDIR', bindir), patch.object(d, 'ASSETS', assets), \
+        with patch.object(d, 'ROOT', node_root), patch.object(d, 'UNIT', unit), patch.object(d, 'BINDIR', bindir), patch.object(d, 'ASSETS', assets), patch.object(d, 'VLESS_BAN_ASSETS', assets), \
              patch.object(d.os, 'geteuid', return_value=0), patch.object(d.platform, 'machine', return_value='x86_64'), \
              patch.object(Path, 'is_dir', is_dir), patch.object(d.urllib.request, 'build_opener', return_value=opener), \
              patch.object(d.urllib.request, 'urlopen', side_effect=lambda *a, **kw: io.BytesIO(content)), \
@@ -146,6 +159,19 @@ class DeployTests(unittest.TestCase):
             self.assertIn('Before=xboard-node.service', unit.read_text())
             self.assertTrue(any('12000:13000/udp' in args for args in commands))
             self.assertTrue(any(args[:3] == ('systemctl', 'enable', '--now') and args[-1] == 'xboard-node-port-hops.service' for args in commands))
+
+    def test_adding_vless_keeps_existing_hysteria2_port_hopping(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            hy2 = {'server_type': 'hysteria2', 'server_port': 443, 'server_addr': 'hy2.example.com', 'ports': '444-8443'}
+            with patch.object(d, 'node_settings', return_value=('hysteria2', 443, {'cert_mode': 'none'})):
+                self.run_deployment(tmp, config=hy2, operation='add')
+            with patch.object(d, 'node_settings', return_value=('vless', 2086, {'cert_mode': 'none'})):
+                _, _, _, commands = self.run_deployment(tmp, node_ids=[930], config={'server_type': 'vless', 'server_port': 2086}, operation='add')
+            script = Path(tmp) / 'sbin' / 'xboard-node-port-hops'
+            self.assertIn('--dport 444:8443 -j REDIRECT --to-ports 443', script.read_text())
+            self.assertFalse(any(args[:3] == ('systemctl', 'disable', '--now') and args[-1] == 'xboard-node-port-hops.service' for args in commands))
+            installed = json.loads((Path(tmp) / 'config' / 'config.yml').read_text())
+            self.assertEqual({x['panel']['node_id'] for x in installed['instances']}, {929, 930})
 
 
 if __name__ == '__main__':

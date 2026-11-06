@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -130,7 +132,20 @@ func (s *Server) bootAfterIPChange(ctx context.Context, account string, id int, 
 	})
 }
 
-func (s *Server) verifyDirectIPv4(ctx context.Context, account string, instance Instance, ip string) error {
+func (s *Server) verifyDirectIPv4(ctx context.Context, account string, instance Instance, ip string, port int) error {
+	if port < 1 || port > 65535 {
+		return errors.New("连通性检查端口必须在 1-65535 之间")
+	}
+	if port != 22 {
+		dialCtx, cancel := context.WithTimeout(ctx, 8*time.Second)
+		defer cancel()
+		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", net.JoinHostPort(ip, strconv.Itoa(port)))
+		if err != nil {
+			return fmt.Errorf("新 IP 的 TCP/%d 尚未连通：%w", port, err)
+		}
+		_ = conn.Close()
+		return nil
+	}
 	probe := instance
 	probe.IPv4 = []string{ip}
 	if s.canTune(account, instance.ID) {
@@ -149,6 +164,16 @@ func (s *Server) verifyDirectIPv4(ctx context.Context, account string, instance 
 }
 
 func (s *Server) runDirectIPChange(ctx context.Context, op *IPChange) (runErr error) {
+	if op.CheckPort == 0 {
+		op.CheckPort = 22
+	}
+	if op.ChinaProbe && op.ChinaProvider == "" {
+		provider, err := s.chinaProbeProvider()
+		if err != nil {
+			return err
+		}
+		op.ChinaProvider = provider
+	}
 	op.Job.Status = "running"
 	if err := s.saveIPChange(op); err != nil {
 		return err
@@ -175,6 +200,19 @@ func (s *Server) runDirectIPChange(ctx context.Context, op *IPChange) (runErr er
 	}
 	if err := s.checkIPTarget(ctx, account, original); err != nil {
 		return err
+	}
+	if op.ChinaProbe && op.CheckChinaOriginal {
+		if err := s.verifyDirectIPv4(ctx, account, original, oldIP, op.CheckPort); err != nil {
+			return fmt.Errorf("面板服务器也无法连接原 IP 的 TCP/%d，无法判断国内路径；未申请新 IP：%w", op.CheckPort, err)
+		}
+		if output, err := s.checkChinaTCP(ctx, op.ChinaProvider, oldIP, op.CheckPort); err == nil {
+			s.ipJobLog(op, fmt.Sprintf("原 IP 国内 TCP/%d 可达：%s", op.CheckPort, strings.TrimSpace(output)))
+			return errors.New("原 IP 从所选国内探测方式可达，未更换 IP")
+		} else if !errors.Is(err, errDomesticTCPUnreachable) {
+			return fmt.Errorf("原 IP 国内探测未能确认连通性，未申请新 IP：%w", err)
+		} else {
+			s.ipJobLog(op, fmt.Sprintf("原 IP 在面板服务器 TCP/%d 可达、国内探测失败；继续更换并验证候选 IP。", op.CheckPort))
+		}
 	}
 	wasRunning := original.Status == "running"
 	if wasRunning {
@@ -222,11 +260,12 @@ func (s *Server) runDirectIPChange(ctx context.Context, op *IPChange) (runErr er
 	}
 
 	if wasRunning {
+		s.ipJobLog(op, fmt.Sprintf("新 IP 配置后，先检查面板服务器 TCP/%d。", op.CheckPort))
 		original, err = s.bootAfterIPChange(ctx, account, original.ID, true, newIP)
 		if err != nil {
 			return fmt.Errorf("新地址已配置，原机启动/分配确认失败；旧 IP 尚未释放：%w", err)
 		}
-		if err := s.verifyDirectIPv4(ctx, account, original, newIP); err != nil {
+		if err := s.verifyDirectIPv4(ctx, account, original, newIP, op.CheckPort); err != nil {
 			s.ipJobLog(op, "新地址连接验证失败，尝试保留并恢复旧地址。")
 			if stopErr := s.ipJSON(ctx, account, "POST", fmt.Sprintf("/linode/instances/%d/shutdown", original.ID), map[string]any{}, nil); stopErr == nil {
 				_, _ = s.waitIPInstance(ctx, account, original.ID, func(i Instance) bool { return i.Status == "offline" })
@@ -237,6 +276,22 @@ func (s *Server) runDirectIPChange(ctx context.Context, op *IPChange) (runErr er
 				_, _ = s.bootAfterIPChange(context.WithoutCancel(ctx), account, original.ID, true, oldIP)
 			}
 			return err
+		}
+		if op.ChinaProbe {
+			output, probeErr := s.checkChinaTCP(ctx, op.ChinaProvider, newIP, op.CheckPort)
+			s.ipJobLog(op, fmt.Sprintf("新 IP 国内 TCP/%d 检测：%s", op.CheckPort, strings.TrimSpace(output)))
+			if probeErr != nil {
+				s.ipJobLog(op, "候选 IP 未通过所选国内探测；尝试移除候选地址并恢复旧 IP。")
+				if stopErr := s.ipJSON(context.WithoutCancel(ctx), account, "POST", fmt.Sprintf("/linode/instances/%d/shutdown", original.ID), map[string]any{}, nil); stopErr == nil {
+					_, _ = s.waitIPInstance(context.WithoutCancel(ctx), account, original.ID, func(i Instance) bool { return i.Status == "offline" })
+					_ = s.removeDirectIPv4(context.WithoutCancel(ctx), op, newIP, iface)
+					if iface != nil {
+						_ = s.updatePublicLinodeIPv4(context.WithoutCancel(ctx), account, original.ID, *iface, []interfaceIPv4Address{{Address: oldIP, Primary: true}})
+					}
+					_, _ = s.bootAfterIPChange(context.WithoutCancel(ctx), account, original.ID, true, oldIP)
+				}
+				return fmt.Errorf("新 IP 未通过国内 TCP/%d 检查，旧 IP 已保留：%w", op.CheckPort, probeErr)
+			}
 		}
 	}
 

@@ -27,15 +27,19 @@ type IPPlan struct {
 	} `json:"price"`
 }
 type IPChange struct {
-	Job           Job      `json:"job"`
-	Original      Instance `json:"original"`
-	Plan          string   `json:"plan"`
-	HelperLabel   string   `json:"helper_label"`
-	HelperID      int      `json:"helper_id"`
-	HelperCleaned bool     `json:"helper_cleaned"`
-	SwapAttempted bool     `json:"swap_attempted"`
-	SwapVerified  bool     `json:"swap_verified"`
-	UseProxy      bool     `json:"use_proxy"`
+	Job                Job      `json:"job"`
+	Original           Instance `json:"original"`
+	Plan               string   `json:"plan"`
+	HelperLabel        string   `json:"helper_label"`
+	HelperID           int      `json:"helper_id"`
+	HelperCleaned      bool     `json:"helper_cleaned"`
+	SwapAttempted      bool     `json:"swap_attempted"`
+	SwapVerified       bool     `json:"swap_verified"`
+	UseProxy           bool     `json:"use_proxy"`
+	CheckPort          int      `json:"check_port,omitempty"`
+	CheckChinaOriginal bool     `json:"check_china_original,omitempty"`
+	ChinaProbe         bool     `json:"china_probe,omitempty"`
+	ChinaProvider      string   `json:"china_provider,omitempty"`
 }
 
 func (s *Server) ipJSON(ctx context.Context, account, method, path string, input, output any) error {
@@ -447,16 +451,31 @@ func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var in struct {
-		Plan           string  `json:"plan"`
-		ExpectedIP     string  `json:"expected_ip"`
-		ConfirmID      int     `json:"confirm_instance_id"`
-		ConfirmBilling bool    `json:"confirm_billing"`
-		ExpectedHourly float64 `json:"expected_hourly"`
-		NodeID         int     `json:"node_id"`
+		Plan               string  `json:"plan"`
+		ExpectedIP         string  `json:"expected_ip"`
+		ConfirmID          int     `json:"confirm_instance_id"`
+		ConfirmBilling     bool    `json:"confirm_billing"`
+		ExpectedHourly     float64 `json:"expected_hourly"`
+		NodeID             int     `json:"node_id"`
+		CheckPort          int     `json:"check_port"`
+		CheckChinaOriginal bool    `json:"check_china_original"`
+		ChinaProbe         bool    `json:"china_probe"`
 	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in) != nil || !in.ConfirmBilling || in.ConfirmID != id || in.NodeID < 0 {
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in) != nil || !in.ConfirmBilling || in.ConfirmID != id || in.NodeID < 0 || in.CheckPort < 0 || in.CheckPort > 65535 {
 		fail(w, 400, "请确认原机 ID、额外 IPv4 可能产生的费用和短暂关机")
 		return
+	}
+	if in.CheckPort == 0 {
+		in.CheckPort = 22
+	}
+	chinaProvider := ""
+	if in.ChinaProbe {
+		provider, providerErr := s.chinaProbeProvider()
+		if providerErr != nil || !s.chinaProbeConfigured(provider) {
+			fail(w, 409, "请先在“国内探测”设置中配置并选择探测方式")
+			return
+		}
+		chinaProvider = provider
 	}
 	instance, err := s.ipInstance(r.Context(), account, id)
 	if err != nil {
@@ -512,7 +531,7 @@ func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	jobID := "ip-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	op := &IPChange{Job: Job{ID: jobID, Kind: "ip_change", Status: "queued", InstanceID: id, TargetID: in.NodeID, AccountID: account, OldIP: in.ExpectedIP}, Original: instance}
+	op := &IPChange{Job: Job{ID: jobID, Kind: "ip_change", Status: "queued", InstanceID: id, TargetID: in.NodeID, AccountID: account, OldIP: in.ExpectedIP}, Original: instance, CheckPort: in.CheckPort, CheckChinaOriginal: in.CheckChinaOriginal, ChinaProbe: in.ChinaProbe, ChinaProvider: chinaProvider}
 	op.UseProxy, _ = r.Context().Value(proxyContextKey{}).(bool)
 	s.mu.Lock()
 	for _, job := range s.jobs {

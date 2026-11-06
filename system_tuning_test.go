@@ -21,9 +21,13 @@ func TestBootTuningJobReportsActualKernelResult(t *testing.T) {
 			s.skipBootTuning = false
 			dnsTestStore(t, s)
 			s.saveRootPassword("legacy", 7, "node", "root-password")
+			s.saveRootPassword("open-ports-legacy", 7, "node", "true")
 			s.sshRun = func(_ context.Context, _ string, script string) (string, error) {
 				if !strings.Contains(script, "tcp_congestion_control=bbr") || !strings.Contains(script, "root soft nofile 65535") {
 					t.Error("missing requested persistent tuning")
+				}
+				if !strings.Contains(script, "ufw insert 1 allow in from any to any") || !strings.Contains(script, "UFW_ALL_PORTS_ENABLED") {
+					t.Error("saved open-all-ports setting not applied during boot")
 				}
 				return result, nil
 			}
@@ -48,5 +52,15 @@ func TestBootTuningJobReportsActualKernelResult(t *testing.T) {
 				time.Sleep(time.Millisecond)
 			}
 		})
+	}
+}
+
+func TestBootInitializationOnlyAddsUFWRulesWhenEnabled(t *testing.T) {
+	if strings.Contains(bootInitializationScript(false), "ufw insert 1") {
+		t.Fatal("UFW allow-all rules must respect the saved instance setting")
+	}
+	script := bootInitializationScript(true)
+	if !strings.Contains(script, "ufw status numbered") || !strings.Contains(script, "ufw insert 1 allow out from any to any") {
+		t.Fatal("boot UFW setup must be idempotent and allow outbound traffic")
 	}
 }

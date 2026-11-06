@@ -4,6 +4,26 @@
 
 独立的 Go 1.22+ Linode 运维面板。主程序：`main.go`，不再使用 Python FastAPI。当前版本为 Go MVP，未完成真实 Linode/SSH/TG 联调。
 
+## VLESS 非法路径拉黑检查
+
+只对 VLESS 非 TLS WebSocket 节点启用错误路径防护。访问非配置路径（例如正确路径为 `/mm`，访问 `/wrong`）会返回 nginx 蜜罐页，并把来源 IP 追加到 `/etc/XboardNode-Plus/blacklist.txt`。黑名单文件在第一次触发封禁时创建。
+
+检查配置与日志：
+
+```sh
+sudo grep -n -A5 -B2 'guard' /etc/XboardNode-Plus/config.yml
+sudo journalctl -u xboard-node.service --since today --no-pager | grep -E 'guard: (enabled|probe|banned)'
+sudo cat /etc/XboardNode-Plus/blacklist.txt
+```
+
+用外部网络测试前确认端口是 VLESS WS 端口；下面请求会封禁发起请求的公网 IP：
+
+```sh
+curl -i --max-time 5 http://服务器IPv4:端口/错误路径
+```
+
+只有安装了防护代码之后新装或重装的 VLESS 节点才会带有该配置。检查不到 `guard.enabled` 时，在面板重装对应 VLESS 节点；如果日志有 `guard: enabled` 但没有 `probe/banned`，则尚未有请求命中错误路径。
+
 ## 已实现
 - Linode 多账号管理及账号移除；创建、开机、关机、重启、删除实例；显示 IP、地区和套餐；Root 密码加密保存
 - wp2 管理员登录同步全部节点（支持动态码），会话加密保存；兼容 muKey 节点列表接口

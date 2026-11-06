@@ -9,115 +9,74 @@ import (
 	"testing"
 )
 
-func TestIPChangeWorkflowKeepsOriginalAndCleansHelper(t *testing.T) {
-	for _, mode := range []string{"success", "swap_rejected", "swap_timeout_but_changed", "verify_failed", "cleanup_failed"} {
-		t.Run(mode, func(t *testing.T) {
-			t.Setenv("LINODE_TOKEN", "mock")
-			t.Setenv("SSH_BOOTSTRAP_DIR", filepath.Join(t.TempDir(), "ssh"))
-			oldIP, newIP := "104.64.213.47", "172.104.46.26"
-			original := Instance{ID: 7, Label: "original", Region: "ap-northeast", Status: "running", IPv4: []string{oldIP}, Image: "linode/debian12"}
-			helper := Instance{ID: 99, Status: "offline", Region: original.Region, IPv4: []string{newIP}}
-			created, deleted, swapped, booted := 0, 0, false, false
-			var requests []string
-			upstream := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				requests = append(requests, r.Method+" "+r.URL.Path)
-				switch {
-				case r.Method == "GET" && r.URL.Path == "/v4/account/settings":
-					w.Write([]byte(`{"interfaces_for_new_linodes":"legacy_config_only"}`))
-				case r.Method == "GET" && r.URL.Path == "/v4/linode/instances/7":
-					json.NewEncoder(w).Encode(original)
-				case r.Method == "POST" && r.URL.Path == "/v4/linode/instances":
-					created++
-					var payload map[string]any
-					json.NewDecoder(r.Body).Decode(&payload)
-					if payload["booted"] != false || payload["image"] != nil || payload["region"] != "ap-northeast" {
-						t.Error("helper must not boot/install OS or use another region")
-					}
-					helper.Label = payload["label"].(string)
-					json.NewEncoder(w).Encode(helper)
-				case r.Method == "GET" && r.URL.Path == "/v4/linode/instances/99":
-					if swapped && mode == "verify_failed" {
-						w.WriteHeader(502)
-						return
-					}
-					json.NewEncoder(w).Encode(helper)
-				case r.Method == "POST" && r.URL.Path == "/v4/linode/instances/7/shutdown":
-					original.Status = "offline"
-					w.Write([]byte(`{}`))
-				case r.Method == "POST" && r.URL.Path == "/v4/networking/ips/assign":
-					var payload struct {
-						Region      string `json:"region"`
-						Assignments []struct {
-							Address string `json:"address"`
-							ID      int    `json:"linode_id"`
-						} `json:"assignments"`
-					}
-					json.NewDecoder(r.Body).Decode(&payload)
-					if payload.Region != original.Region || len(payload.Assignments) != 2 || payload.Assignments[0].Address != newIP || payload.Assignments[0].ID != 7 || payload.Assignments[1].Address != oldIP || payload.Assignments[1].ID != 99 {
-						t.Error("wrong swap assignments")
-					}
-					if mode == "swap_rejected" {
-						w.WriteHeader(400)
-						return
-					}
-					original.IPv4 = []string{newIP}
-					helper.IPv4 = []string{oldIP}
-					swapped = true
-					if mode == "swap_timeout_but_changed" {
-						w.WriteHeader(500)
-						return
-					}
-					w.Write([]byte(`{}`))
-				case r.Method == "POST" && r.URL.Path == "/v4/linode/instances/7/boot":
-					booted = true
-					original.Status = "running"
-					w.Write([]byte(`{}`))
-				case r.Method == "DELETE" && r.URL.Path == "/v4/linode/instances/99":
-					if mode == "cleanup_failed" {
-						w.WriteHeader(503)
-						return
-					}
-					deleted++
-					w.Write([]byte(`{}`))
-				default:
-					t.Errorf("unexpected request (original must not be deleted/rebuilt): %s %s", r.Method, r.URL.Path)
-				}
-			}))
-			defer upstream.Close()
-			t.Setenv("LINODE_API_BASE_URL", upstream.URL+"/v4")
-			s := testServer(upstream.Client())
-			dnsTestStore(t, s)
-			op := &IPChange{Job: Job{ID: "ip-test", Kind: "ip_change", Status: "queued", InstanceID: 7, AccountID: "legacy"}, Original: original, Plan: "g6-nanode-1", HelperLabel: "lnm-ip-7-test"}
-			err := s.runIPChange(context.Background(), op)
-			if created != 1 {
-				t.Fatalf("helper creation count %d", created)
+func TestIPChangeDirectlyReplacesIPv4OnOriginal(t *testing.T) {
+	t.Setenv("LINODE_TOKEN", "mock")
+	t.Setenv("SSH_BOOTSTRAP_DIR", filepath.Join(t.TempDir(), "ssh"))
+	oldIP, newIP := "104.64.213.47", "172.104.46.26"
+	original := Instance{ID: 7, Label: "original", Region: "ap-northeast", Status: "running", IPv4: []string{oldIP}, Image: "linode/debian12"}
+	allocated, oldReleased, boots, shutdowns := false, false, 0, 0
+	var requests []string
+	upstream := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests = append(requests, r.Method+" "+r.URL.Path)
+		switch {
+		case r.Method == "GET" && r.URL.Path == "/v4/linode/instances/7":
+			json.NewEncoder(w).Encode(original)
+		case r.Method == "GET" && r.URL.Path == "/v4/networking/ips/"+oldIP:
+			w.Write([]byte(`{"linode_id":7,"public":true,"reserved":false}`))
+		case r.Method == "GET" && r.URL.Path == "/v4/linode/instances/7/configs":
+			w.Write([]byte(`{"data":[{"helpers":{"network":true}}]}`))
+		case r.Method == "POST" && r.URL.Path == "/v4/linode/instances/7/shutdown":
+			shutdowns++
+			original.Status = "offline"
+			w.Write([]byte(`{}`))
+		case r.Method == "POST" && r.URL.Path == "/v4/linode/instances/7/ips":
+			var payload map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&payload)
+			if payload["type"] != "ipv4" || payload["public"] != true {
+				t.Errorf("unexpected additional-IP request: %#v", payload)
 			}
-			switch mode {
-			case "success", "swap_timeout_but_changed":
-				if err != nil || op.Job.Status != "success" || !op.SwapVerified || !op.HelperCleaned || deleted != 1 || !booted || original.ID != 7 || publicIP(original) != newIP {
-					t.Fatalf("swap failed: %v %+v", err, op.Job)
-				}
-			case "swap_rejected":
-				if err == nil || deleted != 1 || publicIP(original) != oldIP || original.Status != "running" {
-					t.Fatal("failed swap did not restore original and clean helper")
-				}
-			case "verify_failed":
-				if err == nil || deleted != 0 || op.HelperCleaned {
-					t.Fatal("unknown swap must preserve helper")
-				}
-			case "cleanup_failed":
-				if err == nil || !op.SwapVerified || op.HelperCleaned || original.Status != "running" {
-					t.Fatal("cleanup failure was hidden or original not running")
-				}
+			allocated = true
+			original.IPv4 = []string{oldIP, newIP}
+			w.Write([]byte(`{"address":"172.104.46.26","linode_id":7,"public":true,"region":"ap-northeast"}`))
+		case r.Method == "POST" && r.URL.Path == "/v4/linode/instances/7/boot":
+			boots++
+			original.Status = "running"
+			w.Write([]byte(`{}`))
+		case r.Method == "DELETE" && r.URL.Path == "/v4/linode/instances/7/ips/"+oldIP:
+			if !allocated {
+				t.Error("old IP released before a new IP was allocated")
 			}
-			restored, err := s.loadIPChange("ip-test")
-			if err != nil || restored.HelperID != 99 {
-				t.Fatal("helper identity not persisted")
-			}
-			if strings.Contains(strings.Join(requests, "\n"), "DELETE /v4/linode/instances/7\n") {
-				t.Fatal("original deleted")
-			}
-		})
+			oldReleased = true
+			original.IPv4 = []string{newIP}
+			w.Write([]byte(`{}`))
+		default:
+			t.Errorf("unexpected Linode request: %s %s", r.Method, r.URL.Path)
+		}
+	}))
+	defer upstream.Close()
+	t.Setenv("LINODE_API_BASE_URL", upstream.URL+"/v4")
+	s := testServer(upstream.Client())
+	dnsTestStore(t, s)
+	if err := s.saveRootPassword("legacy", 7, "original", "secret-root-password"); err != nil {
+		t.Fatal(err)
+	}
+	s.sshRun = func(_ context.Context, ip, _ string) (string, error) {
+		if ip != newIP {
+			t.Errorf("SSH verification used %s, want new IP", ip)
+		}
+		return "SSH ok", nil
+	}
+	op := &IPChange{Job: Job{ID: "ip-test", Kind: "ip_change", Status: "queued", InstanceID: 7, AccountID: "legacy", OldIP: oldIP}, Original: original}
+	if err := s.runIPChange(context.Background(), op); err != nil {
+		t.Fatal(err)
+	}
+	if !allocated || !oldReleased || boots != 2 || shutdowns != 2 || original.Status != "running" || publicIP(original) != newIP || op.Job.Status != "success" || !op.SwapVerified {
+		t.Fatalf("direct IP replacement failed: allocated=%v released=%v boots=%d shutdowns=%d original=%+v job=%+v", allocated, oldReleased, boots, shutdowns, original, op.Job)
+	}
+	for _, request := range requests {
+		if strings.Contains(request, "POST /v4/linode/instances\n") {
+			t.Fatal("direct IP flow created a temporary Linode")
+		}
 	}
 }
 func TestIPChangeRequiresConfirmationAndNetworkHelper(t *testing.T) {

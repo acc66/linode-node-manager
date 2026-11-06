@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -198,7 +197,7 @@ func (s *Server) cleanupIPHelper(ctx context.Context, op *IPChange) error {
 	op.HelperCleaned = true
 	return s.saveIPChange(op)
 }
-func (s *Server) runIPChange(ctx context.Context, op *IPChange) (runErr error) {
+func (s *Server) runIPChangeUsingHelper(ctx context.Context, op *IPChange) (runErr error) {
 	op.Job.Status = "running"
 	if err := s.saveIPChange(op); err != nil {
 		return err
@@ -432,36 +431,13 @@ func (s *Server) ipChangePlanAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 409, err.Error())
 		return
 	}
-	plans := []IPPlan{}
-	for page := 1; page <= 20; page++ {
-		var result struct {
-			Data  []IPPlan `json:"data"`
-			Pages int      `json:"pages"`
-		}
-		if err := s.ipJSON(r.Context(), account, "GET", fmt.Sprintf("/linode/types?page_size=100&page=%d", page), nil, &result); err != nil {
-			fail(w, 502, err.Error())
-			return
-		}
-		for _, plan := range result.Data {
-			if plan.Price.Hourly > 0 && (plan.Class == "nanode" || plan.Class == "standard") {
-				plans = append(plans, plan)
-			}
-		}
-		if page >= result.Pages {
-			break
-		}
-	}
-	sort.Slice(plans, func(i, j int) bool { return plans[i].Price.Hourly < plans[j].Price.Hourly })
-	if len(plans) > 10 {
-		plans = plans[:10]
-	}
 	bound := 0
 	if s.credentials != nil {
 		if raw, ok := s.credentials.token("node-binding-" + account + "/" + strconv.Itoa(id)); ok {
 			bound, _ = strconv.Atoi(raw)
 		}
 	}
-	send(w, 200, map[string]any{"instance": instance, "plans": plans, "bound_node_id": bound, "billing_notice": "临时实例会按所选套餐计费，地区价格和最终账单以 Linode 为准。流程会短暂关机；不保证新 IP 在你的网络可用。"})
+	send(w, 200, map[string]any{"instance": instance, "bound_node_id": bound, "billing_notice": "直接给原机申请第二个公网 IPv4，额外 IP 可能按 Linode 价格收费；账号需要有额外 IPv4 配额。只有新 IP 通过连接验证后才释放旧 IP。"})
 }
 func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 	account := r.URL.Query().Get("account_id")
@@ -478,8 +454,8 @@ func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 		ExpectedHourly float64 `json:"expected_hourly"`
 		NodeID         int     `json:"node_id"`
 	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in) != nil || in.Plan == "" || !in.ConfirmBilling || in.ConfirmID != id || in.NodeID < 0 {
-		fail(w, 400, "请确认原机 ID、临时套餐和费用")
+	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 8192)).Decode(&in) != nil || !in.ConfirmBilling || in.ConfirmID != id || in.NodeID < 0 {
+		fail(w, 400, "请确认原机 ID、额外 IPv4 可能产生的费用和短暂关机")
 		return
 	}
 	instance, err := s.ipInstance(r.Context(), account, id)
@@ -508,23 +484,14 @@ func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		config, err := s.dnsConfigFor(domain)
 		if err != nil || config == nil {
-			fail(w, 409, "绑定节点连接域名没有可用自动 DNS 配置，未创建临时实例")
+			fail(w, 409, "绑定节点连接域名没有可用自动 DNS 配置，未申请新 IP")
 			return
 		}
 		panel, _ := url.Parse(env("WP2_BASE_URL", ""))
 		if domain == config.Zone || domain == strings.ToLower(env("PANEL_DOMAIN", "")) || (panel != nil && domain == panel.Hostname()) {
-			fail(w, 409, "绑定节点使用受保护的根域名或面板域名，未创建临时实例")
+			fail(w, 409, "绑定节点使用受保护的根域名或面板域名，未申请新 IP")
 			return
 		}
-	}
-	var plan IPPlan
-	if err := s.ipJSON(r.Context(), account, "GET", "/linode/types/"+url.PathEscape(in.Plan), nil, &plan); err != nil {
-		fail(w, 502, err.Error())
-		return
-	}
-	if plan.ID != in.Plan || plan.Price.Hourly <= 0 || math.Abs(plan.Price.Hourly-in.ExpectedHourly) > 1e-9 || (plan.Class != "standard" && plan.Class != "nanode") {
-		fail(w, 409, "套餐或参考价格已变化，请重新打开换 IP 窗口")
-		return
 	}
 	if s.credentials != nil {
 		s.credentials.mu.RLock()
@@ -540,12 +507,12 @@ func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		s.credentials.mu.RUnlock()
 		if unfinished != "" {
-			fail(w, 409, "该原机有未清理的临时实例，请先处理换 IP 任务 "+unfinished)
+			fail(w, 409, "该原机有未处理的旧换 IP 任务，请先核对任务 "+unfinished)
 			return
 		}
 	}
 	jobID := "ip-" + strconv.FormatInt(time.Now().UnixNano(), 36)
-	op := &IPChange{Job: Job{ID: jobID, Kind: "ip_change", Status: "queued", InstanceID: id, TargetID: in.NodeID, AccountID: account, OldIP: in.ExpectedIP}, Original: instance, Plan: plan.ID, HelperLabel: "lnm-ip-" + strconv.Itoa(id) + "-" + strings.TrimPrefix(jobID, "ip-")}
+	op := &IPChange{Job: Job{ID: jobID, Kind: "ip_change", Status: "queued", InstanceID: id, TargetID: in.NodeID, AccountID: account, OldIP: in.ExpectedIP}, Original: instance}
 	op.UseProxy, _ = r.Context().Value(proxyContextKey{}).(bool)
 	s.mu.Lock()
 	for _, job := range s.jobs {
@@ -561,7 +528,7 @@ func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 		s.mu.Lock()
 		delete(s.jobs, jobID)
 		s.mu.Unlock()
-		fail(w, 500, "无法持久保存换 IP 任务，未创建收费临时实例")
+		fail(w, 500, "无法持久保存换 IP 任务，未申请新 IP")
 		return
 	}
 	go func() {

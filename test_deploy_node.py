@@ -43,6 +43,17 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(d.release_assets('vless', 'amd64')[0], 'acc66/vless-ban')
         self.assertEqual(d.release_assets('hysteria2', 'amd64')[0], 'acc66/XboardNode-Plus')
 
+    def test_plain_vless_ws_writes_guard_and_blacklist_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root, _, _, _ = self.run_deployment(tmp, config={
+                'server_type': 'vless', 'server_port': 2086, 'tls': 0,
+                'network': 'ws', 'network_settings': {'path': '/mm'},
+            })
+            installed = json.loads((root / 'config.yml').read_text())
+            guard = installed['instances'][0]['guard']
+            self.assertTrue(guard['enabled'])
+            self.assertEqual(guard['blacklist'], str(root / 'blacklist.txt'))
+
     def test_add_nodes_rejects_duplicates_and_merges_hopping_rules(self):
         entry = {'panel': {'url': 'https://wp2.example/', 'node_id': 929}}
         with self.assertRaisesRegex(ValueError, '已安装'):

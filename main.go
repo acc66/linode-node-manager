@@ -33,18 +33,19 @@ type Server struct {
 	sshRun         func(context.Context, string, string) (string, error)
 }
 type Snapshot struct {
-	AccountID string  `json:"account_id,omitempty"`
-	ID        int     `json:"id"`
-	Label     string  `json:"label"`
-	State     string  `json:"status"`
-	CPU       float64 `json:"cpu"`
-	Memory    float64 `json:"memory"`
-	Disk      float64 `json:"disk"`
-	Uptime    float64 `json:"uptime"`
-	Service   string  `json:"service"`
-	Failures  int     `json:"failures"`
-	Alert     string  `json:"alert_state"`
-	Updated   string  `json:"updated_at"`
+	AccountID    string  `json:"account_id,omitempty"`
+	ID           int     `json:"id"`
+	Label        string  `json:"label"`
+	State        string  `json:"status"`
+	CPU          float64 `json:"cpu"`
+	Memory       float64 `json:"memory"`
+	Disk         float64 `json:"disk"`
+	Uptime       float64 `json:"uptime"`
+	Service      string  `json:"service"`
+	MonitorError string  `json:"monitor_error,omitempty"`
+	Failures     int     `json:"failures"`
+	Alert        string  `json:"alert_state"`
+	Updated      string  `json:"updated_at"`
 }
 type Job struct {
 	Kind          string `json:"kind,omitempty"`
@@ -378,8 +379,16 @@ func (s *Server) poll(ctx context.Context) {
 					next.Disk = v.Disk
 					next.Uptime = v.Uptime
 					next.Service = v.Service
+				} else {
+					next.MonitorError = "SSH 探针返回无效监控数据"
 				}
+			} else {
+				next.MonitorError = err.Error()
 			}
+		} else if inst.Status == "running" {
+			next.MonitorError = "Linode 实例没有公网 IPv4 地址"
+		} else {
+			next.MonitorError = "Linode 实例状态：" + inst.Status
 		}
 		if next.State == "offline" {
 			next.Failures = old.Failures + 1

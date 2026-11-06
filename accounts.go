@@ -358,8 +358,16 @@ func (s *Server) pollAccounts(ctx context.Context) {
 							next.Disk = metric.Disk
 							next.Uptime = metric.Uptime
 							next.Service = metric.Service
+						} else {
+							next.MonitorError = "SSH 探针返回无效监控数据"
 						}
+					} else {
+						next.MonitorError = probeErr.Error()
 					}
+				} else if inst.Status == "running" {
+					next.MonitorError = "Linode 实例没有公网 IPv4 地址"
+				} else {
+					next.MonitorError = "Linode 实例状态：" + inst.Status
 				}
 				if next.State == "offline" {
 					next.Failures = old.Failures + 1

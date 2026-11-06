@@ -183,6 +183,34 @@ def remove_port_hop_rules():
     command('iptables', '-t', 'nat', '-X', 'LNM-HY2-HOP', check=False)
 
 
+def ensure_iptables():
+    """Install the distro's iptables compatibility tool when UDP hopping needs it."""
+    if shutil.which('iptables'):
+        return
+    managers = [
+        ('apt-get', ['apt-get', 'update'], ['apt-get', 'install', '-y', 'iptables']),
+        ('dnf', None, ['dnf', 'install', '-y', 'iptables']),
+        ('yum', None, ['yum', 'install', '-y', 'iptables']),
+        ('apk', None, ['apk', 'add', '--no-cache', 'iptables']),
+    ]
+    selected = next((entry for entry in managers if shutil.which(entry[0])), None)
+    if not selected:
+        raise ValueError('Hysteria2 需要 UDP 端口跳跃，但系统未安装 iptables，且未检测到 apt/dnf/yum/apk 包管理器；请安装 iptables 后重试')
+    name, update, install = selected
+    print('系统缺少 iptables，正在使用 %s 自动安装…' % name, flush=True)
+    try:
+        if update:
+            command(*update)
+        command(*install)
+    except (OSError, subprocess.SubprocessError) as exc:
+        detail = getattr(exc, 'stdout', '') or str(exc)
+        detail = ' '.join(str(detail).split())[-500:]
+        raise ValueError('自动安装 iptables 失败（%s）：%s；请检查软件源/网络后重试' % (name, detail)) from exc
+    if not shutil.which('iptables'):
+        raise ValueError('系统包管理器已运行，但仍找不到 iptables 命令；请检查该系统的 iptables 包安装结果')
+    print('iptables 已安装，继续配置 Hysteria2 UDP 端口跳跃。', flush=True)
+
+
 def deploy(payload):
     if os.geteuid() != 0 or not Path('/run/systemd/system').is_dir():
         raise ValueError('自动部署需要支持 systemd 的 root Linux 服务器')
@@ -289,8 +317,8 @@ def deploy(payload):
     was_hop_enabled = command('systemctl', 'is-enabled', 'xboard-node-port-hops.service', check=False).returncode == 0
     mutated = False
     hop_rules = [(start, end, item['port']) for item in prepared for start, end in item['hops']]
-    if hop_rules and not shutil.which('iptables'):
-        raise ValueError('当前系统缺少 iptables，无法配置 Hysteria2 UDP 端口跳跃')
+    if hop_rules:
+        ensure_iptables()
     try:
         with tempfile.TemporaryDirectory(prefix='xn-deploy-') as temp:
             for name, digest in release_map.items():

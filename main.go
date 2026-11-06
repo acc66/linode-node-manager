@@ -33,19 +33,24 @@ type Server struct {
 	sshRun         func(context.Context, string, string) (string, error)
 }
 type Snapshot struct {
-	AccountID    string  `json:"account_id,omitempty"`
-	ID           int     `json:"id"`
-	Label        string  `json:"label"`
-	State        string  `json:"status"`
-	CPU          float64 `json:"cpu"`
-	Memory       float64 `json:"memory"`
-	Disk         float64 `json:"disk"`
-	Uptime       float64 `json:"uptime"`
-	Service      string  `json:"service"`
-	MonitorError string  `json:"monitor_error,omitempty"`
-	Failures     int     `json:"failures"`
-	Alert        string  `json:"alert_state"`
-	Updated      string  `json:"updated_at"`
+	AccountID        string  `json:"account_id,omitempty"`
+	ID               int     `json:"id"`
+	Label            string  `json:"label"`
+	State            string  `json:"status"`
+	CPU              float64 `json:"cpu"`
+	Memory           float64 `json:"memory"`
+	Disk             float64 `json:"disk"`
+	Uptime           float64 `json:"uptime"`
+	Service          string  `json:"service"`
+	MonitorError     string  `json:"monitor_error,omitempty"`
+	NetworkInterface string  `json:"network_interface,omitempty"`
+	DownloadMbps     float64 `json:"download_mbps"`
+	UploadMbps       float64 `json:"upload_mbps"`
+	DownloadBytes    int64   `json:"download_bytes"`
+	UploadBytes      int64   `json:"upload_bytes"`
+	Failures         int     `json:"failures"`
+	Alert            string  `json:"alert_state"`
+	Updated          string  `json:"updated_at"`
 }
 type Job struct {
 	Kind          string `json:"kind,omitempty"`
@@ -57,6 +62,7 @@ type Job struct {
 	DNSStatus     string `json:"dns_status,omitempty"`
 	InstanceID    int    `json:"instance_id,omitempty"`
 	TargetID      int    `json:"target_id,omitempty"`
+	TargetIDs     []int  `json:"target_ids,omitempty"`
 	AccountID     string `json:"account_id,omitempty"`
 	ID            string `json:"job_id"`
 	Status        string `json:"status"`
@@ -317,13 +323,26 @@ const probeScript = `python3 - <<'PY'
 import json,os,time,subprocess
 def cpu():
  a=list(map(int,open('/proc/stat').readline().split()[1:]));return sum(a),a[3]+a[4]
+def network():
+ rows={}
+ for line in open('/proc/net/dev').read().splitlines()[2:]:
+  name,values=line.split(':',1);name=name.strip();fields=list(map(int,values.split()));rows[name]=(fields[0],fields[8])
+ try:
+  for line in open('/proc/net/route').read().splitlines()[1:]:
+   fields=line.split()
+   if fields[1]=='00000000' and int(fields[3],16)&1 and fields[0] in rows:return fields[0],*rows[fields[0]]
+ except (OSError,ValueError,IndexError):pass
+ usable={name:counts for name,counts in rows.items() if name!='lo' and not name.startswith(('docker','br-','veth','virbr','tun','wg'))}
+ return 'all interfaces',sum(v[0] for v in usable.values()),sum(v[1] for v in usable.values())
 a,b=cpu();time.sleep(.25);c,d=cpu()
+interface,rx1,tx1=network();time.sleep(.25);_,rx2,tx2=network()
 m={}
 for line in open('/proc/meminfo'):
  k,v=line.split(':',1);m[k]=int(v.split()[0])
 st=os.statvfs('/');total=st.f_blocks*st.f_frsize;free=st.f_bavail*st.f_frsize
 svc=subprocess.run(['systemctl','is-active','xboard-node.service'],capture_output=True,text=True,timeout=5).stdout.strip()
-print(json.dumps({'cpu':round(100*(1-(d-b)/max(1,c-a)),1),'memory':round(100*(1-m.get('MemAvailable',0)/max(1,m.get('MemTotal',1))),1),'disk':round(100*(1-free/max(1,total)),1),'uptime':int(float(open('/proc/uptime').read().split()[0])),'service':svc}))
+seconds=.25
+print(json.dumps({'cpu':round(100*(1-(d-b)/max(1,c-a)),1),'memory':round(100*(1-m.get('MemAvailable',0)/max(1,m.get('MemTotal',1))),1),'disk':round(100*(1-free/max(1,total)),1),'uptime':int(float(open('/proc/uptime').read().split()[0])),'service':svc,'network_interface':interface,'download_mbps':round(max(0,rx2-rx1)*8/seconds/1000000,3),'upload_mbps':round(max(0,tx2-tx1)*8/seconds/1000000,3),'download_bytes':rx2,'upload_bytes':tx2}))
 PY
 `
 
@@ -366,11 +385,16 @@ func (s *Server) poll(ctx context.Context) {
 			cancel()
 			if err == nil {
 				var v struct {
-					CPU     float64 `json:"cpu"`
-					Memory  float64 `json:"memory"`
-					Disk    float64 `json:"disk"`
-					Uptime  float64 `json:"uptime"`
-					Service string  `json:"service"`
+					CPU              float64 `json:"cpu"`
+					Memory           float64 `json:"memory"`
+					Disk             float64 `json:"disk"`
+					Uptime           float64 `json:"uptime"`
+					Service          string  `json:"service"`
+					NetworkInterface string  `json:"network_interface"`
+					DownloadMbps     float64 `json:"download_mbps"`
+					UploadMbps       float64 `json:"upload_mbps"`
+					DownloadBytes    int64   `json:"download_bytes"`
+					UploadBytes      int64   `json:"upload_bytes"`
 				}
 				if json.Unmarshal([]byte(output), &v) == nil && v.CPU >= 0 && v.CPU <= 100 && v.Memory >= 0 && v.Memory <= 100 && v.Disk >= 0 && v.Disk <= 100 && v.Uptime >= 0 {
 					next.State = "online"
@@ -379,6 +403,11 @@ func (s *Server) poll(ctx context.Context) {
 					next.Disk = v.Disk
 					next.Uptime = v.Uptime
 					next.Service = v.Service
+					next.NetworkInterface = v.NetworkInterface
+					next.DownloadMbps = v.DownloadMbps
+					next.UploadMbps = v.UploadMbps
+					next.DownloadBytes = v.DownloadBytes
+					next.UploadBytes = v.UploadBytes
 				} else {
 					next.MonitorError = "SSH 探针返回无效监控数据"
 				}
@@ -426,6 +455,117 @@ func (s *Server) monitoring(ctx context.Context) {
 		}
 	}
 }
+func jobsShareTargets(job Job, targets []int) bool {
+	jobTargets := job.TargetIDs
+	if len(jobTargets) == 0 && job.TargetID > 0 {
+		jobTargets = []int{job.TargetID}
+	}
+	for _, old := range jobTargets {
+		for _, target := range targets {
+			if old == target {
+				return true
+			}
+		}
+	}
+	return false
+}
+func (s *Server) monitorRefreshAPI(w http.ResponseWriter, r *http.Request) {
+	account := r.URL.Query().Get("account_id")
+	if account == "" {
+		fail(w, 400, "请先选择一个 Linode 账号")
+		return
+	}
+	if _, err := s.accountToken(account); err != nil {
+		fail(w, 400, "Linode 账号未配置或已移除")
+		return
+	}
+	id, err := strconv.Atoi(r.URL.Query().Get("instance_id"))
+	if err != nil || id <= 0 {
+		fail(w, 400, "请选择要实时采样的 Linode 实例")
+		return
+	}
+	body, status, err := s.linodeFor(r.Context(), account, http.MethodGet, fmt.Sprintf("/linode/instances/%d", id), nil)
+	if err != nil || status != http.StatusOK {
+		fail(w, 502, "读取 Linode 实例失败，请检查账号 Token 与代理")
+		return
+	}
+	var instance Instance
+	if json.Unmarshal(body, &instance) != nil {
+		fail(w, 502, "Linode 实例数据格式无效")
+		return
+	}
+	next := Snapshot{AccountID: account, ID: id, Label: instance.Label, State: "offline", Updated: time.Now().UTC().Format(time.RFC3339)}
+	old := Snapshot{}
+	key := account + "/" + strconv.Itoa(id)
+	s.mu.RLock()
+	if account == "legacy" {
+		old = s.status[id]
+	} else {
+		old = s.accountStatus[key]
+	}
+	s.mu.RUnlock()
+	if instance.Status != "running" {
+		next.MonitorError = "Linode 实例状态：" + instance.Status
+	} else if publicIP(instance) == "" {
+		next.MonitorError = "Linode 实例没有公网 IPv4 地址"
+	} else {
+		ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
+		output, probeErr := s.deploySSH(ctx, account, instance, probeScript)
+		cancel()
+		if probeErr != nil {
+			next.MonitorError = probeErr.Error()
+		} else {
+			var metric struct {
+				CPU              float64 `json:"cpu"`
+				Memory           float64 `json:"memory"`
+				Disk             float64 `json:"disk"`
+				Uptime           float64 `json:"uptime"`
+				Service          string  `json:"service"`
+				NetworkInterface string  `json:"network_interface"`
+				DownloadMbps     float64 `json:"download_mbps"`
+				UploadMbps       float64 `json:"upload_mbps"`
+				DownloadBytes    int64   `json:"download_bytes"`
+				UploadBytes      int64   `json:"upload_bytes"`
+			}
+			if json.Unmarshal([]byte(output), &metric) != nil || metric.CPU < 0 || metric.CPU > 100 || metric.Memory < 0 || metric.Memory > 100 || metric.Disk < 0 || metric.Disk > 100 || metric.DownloadMbps < 0 || metric.UploadMbps < 0 || metric.DownloadBytes < 0 || metric.UploadBytes < 0 {
+				next.MonitorError = "SSH 探针返回无效监控数据"
+			} else {
+				next.State = "online"
+				next.CPU = metric.CPU
+				next.Memory = metric.Memory
+				next.Disk = metric.Disk
+				next.Uptime = metric.Uptime
+				next.Service = metric.Service
+				next.NetworkInterface = metric.NetworkInterface
+				next.DownloadMbps = metric.DownloadMbps
+				next.UploadMbps = metric.UploadMbps
+				next.DownloadBytes = metric.DownloadBytes
+				next.UploadBytes = metric.UploadBytes
+				next.Alert = alertsFor(next)
+			}
+		}
+	}
+	if next.State != "online" {
+		next.Failures = old.Failures + 1
+		if next.Failures >= number("ALERT_FAILURE_COUNT", 3) {
+			next.Alert = "offline"
+		}
+	}
+	s.mu.Lock()
+	if account == "legacy" {
+		if s.status == nil {
+			s.status = map[int]Snapshot{}
+		}
+		s.status[id] = next
+	} else {
+		if s.accountStatus == nil {
+			s.accountStatus = map[string]Snapshot{}
+		}
+		s.accountStatus[key] = next
+	}
+	s.mu.Unlock()
+	send(w, 200, next)
+}
 func (s *Server) install(w http.ResponseWriter, r *http.Request) {
 	accountID := r.URL.Query().Get("account_id")
 	if accountID == "" {
@@ -439,11 +579,28 @@ func (s *Server) install(w http.ResponseWriter, r *http.Request) {
 		InstanceID int    `json:"instance_id"`
 		Mode       string `json:"mode"`
 		TargetID   int    `json:"target_id"`
+		TargetIDs  []int  `json:"target_ids"`
 	}
-	if json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&in) != nil || in.InstanceID <= 0 || in.TargetID <= 0 || in.Mode != "node" {
-		fail(w, 400, "Valid instance_id, node mode and target_id required")
+	if json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&in) != nil || in.InstanceID <= 0 || in.Mode != "node" {
+		fail(w, 400, "Valid instance_id and node mode required")
 		return
 	}
+	if len(in.TargetIDs) == 0 && in.TargetID > 0 {
+		in.TargetIDs = []int{in.TargetID}
+	}
+	if len(in.TargetIDs) == 0 || len(in.TargetIDs) > 20 {
+		fail(w, 400, "请至少选择一个节点，最多可一次安装 20 个")
+		return
+	}
+	seenTargets := map[int]bool{}
+	for _, target := range in.TargetIDs {
+		if target <= 0 || seenTargets[target] {
+			fail(w, 400, "节点 ID 无效或重复")
+			return
+		}
+		seenTargets[target] = true
+	}
+	in.TargetID = in.TargetIDs[0]
 	token := os.Getenv("WP2_API_TOKEN")
 	base := env("WP2_BASE_URL", "")
 	u, e := url.Parse(base)
@@ -465,27 +622,41 @@ func (s *Server) install(w http.ResponseWriter, r *http.Request) {
 	id := strconv.FormatInt(time.Now().UnixNano(), 36)
 	s.mu.Lock()
 	for _, job := range s.jobs {
-		if (job.Status == "queued" || job.Status == "running") && ((job.AccountID == accountID && job.InstanceID == in.InstanceID) || job.TargetID == in.TargetID) {
+		if (job.Status == "queued" || job.Status == "running") && ((job.AccountID == accountID && job.InstanceID == in.InstanceID) || jobsShareTargets(job, in.TargetIDs)) {
 			s.mu.Unlock()
 			fail(w, 409, "该服务器或 wp2 节点正在安装，请等待当前任务完成")
 			return
 		}
 	}
-	s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, Status: "queued"}
+	s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, TargetIDs: append([]int(nil), in.TargetIDs...), Status: "queued"}
 	s.mu.Unlock()
 	go func() {
 		s.mu.Lock()
-		s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, Status: "running"}
+		s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, TargetIDs: append([]int(nil), in.TargetIDs...), Status: "running"}
 		s.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
 		defer cancel()
-		dnsReady, prefix, err := s.prepareDeploymentDNS(ctx, base, token, in.TargetID, &inst)
+		dnsReady := false
+		dnsDomainMap := map[int]string{}
 		dnsStatus := "skipped"
-		if dnsReady {
-			dnsStatus = "updated"
-		}
-		if err != nil {
-			dnsStatus = "failed"
+		prefix := ""
+		var err error
+		for _, target := range in.TargetIDs {
+			inst.DNSDomain = ""
+			ready, nodeLog, dnsErr := s.prepareDeploymentDNS(ctx, base, token, target, &inst)
+			prefix += fmt.Sprintf("── wp2 节点 #%d ──\n", target) + nodeLog
+			if inst.DNSDomain != "" {
+				dnsDomainMap[target] = inst.DNSDomain
+			}
+			if ready {
+				dnsReady = true
+				dnsStatus = "updated"
+			}
+			if dnsErr != nil {
+				err = dnsErr
+				dnsStatus = "failed"
+				break
+			}
 		}
 		output := prefix
 		if err == nil {
@@ -495,7 +666,7 @@ func (s *Server) install(w http.ResponseWriter, r *http.Request) {
 			current.DNSStatus = dnsStatus
 			s.jobs[id] = current
 			s.mu.Unlock()
-			script := deploymentScript(base, token, in.TargetID, inst, dnsReady)
+			script := deploymentScript(base, token, in.TargetIDs, inst, dnsReady, dnsDomainMap)
 			var remote string
 			remote, err = s.deploySSH(ctx, accountID, inst, script, func(progress string) {
 				text := prefix + progress
@@ -524,10 +695,12 @@ func (s *Server) install(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if state == "success" {
-			_ = s.saveRootPassword("node-binding-"+accountID, inst.ID, inst.Label, strconv.Itoa(in.TargetID))
+			for _, target := range in.TargetIDs {
+				_ = s.saveRootPassword("node-binding-"+accountID, inst.ID, inst.Label, strconv.Itoa(target))
+			}
 		}
 		s.mu.Lock()
-		s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, Status: state, Log: output, DNSStatus: dnsStatus}
+		s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, TargetIDs: append([]int(nil), in.TargetIDs...), Status: state, Log: output, DNSStatus: dnsStatus}
 		s.mu.Unlock()
 	}()
 	send(w, 202, map[string]string{"job_id": id, "status": "queued"})
@@ -616,6 +789,7 @@ func newHandler(s *Server) http.Handler {
 	mux.HandleFunc("GET /api/accounts", s.auth(s.accountsAPI))
 	mux.HandleFunc("POST /api/accounts", s.auth(s.accountsAPI))
 	mux.HandleFunc("DELETE /api/accounts/{id}", s.auth(s.deleteAccount))
+	mux.HandleFunc("GET /api/accounts/{id}/billing", s.auth(s.accountBilling))
 	mux.HandleFunc("GET /api/monitor", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		defer s.mu.RUnlock()
@@ -628,6 +802,7 @@ func newHandler(s *Server) http.Handler {
 		}
 		send(w, 200, map[string]any{"instances": items})
 	}))
+	mux.HandleFunc("GET /api/monitor/refresh", s.auth(s.monitorRefreshAPI))
 	mux.HandleFunc("POST /api/deployments/install", s.auth(s.install))
 	mux.HandleFunc("GET /api/deployments/{id}", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
@@ -730,41 +905,48 @@ const htmlPage = `<!doctype html>
 <head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><meta name="theme-color" content="#0b1120"><title>Linode 节点管理</title>
 <style>
-:root{color-scheme:dark;--bg:#0b1120;--surface:#111c30;--raised:#18263e;--line:#283953;--text:#e8eef9;--muted:#9aaec8;--blue:#5499ff;--green:#5ed5b0;--red:#ff939d;--radius:18px}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:90px}body{margin:0;background:radial-gradient(ellipse at 5% 0%,#152a49 0,transparent 45%),var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}button,input,select{font:inherit}button{cursor:pointer;min-height:42px;padding:9px 15px;border:1px solid var(--line);border-radius:11px;background:var(--raised);color:var(--text);font-weight:600;transition:background .15s,border-color .15s}button:hover:not(:disabled){background:#223753;border-color:#5e7fa9}button:disabled{opacity:.4;cursor:not-allowed}.primary{background:#397eea;border-color:#397eea;color:#fff}.primary:hover:not(:disabled){background:#4b90fc}.danger{color:var(--red)}a{color:inherit;text-decoration:none}button,input,select,a,summary{-webkit-tap-highlight-color:transparent}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--blue);outline-offset:3px}input,select{min-width:0;width:100%;min-height:44px;background:#0d1728;border:1px solid #344763;border-radius:10px;padding:10px 12px;color:var(--text);font-size:16px}input::placeholder{color:#8194ad}input[type=checkbox]{width:19px;min-height:19px;height:19px;flex-shrink:0;accent-color:#548ff4;margin:0}label{display:flex;flex-direction:column;gap:7px;color:var(--muted);font-size:13px}.check{display:flex;flex-direction:row;align-items:center;gap:10px;min-height:44px;color:var(--text)}.topbar{position:sticky;top:0;z-index:20;background:#0b1120ed;border-bottom:1px solid #24354f;backdrop-filter:blur(16px)}.top-inner{max-width:1180px;margin:auto;padding:15px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{width:38px;height:38px;display:grid;place-items:center;background:#23457a;border:1px solid #3c6eb4;border-radius:12px;color:#a9ceff;font-weight:800;font-size:20px}.brand strong{font-size:16px;letter-spacing:.2px}.brand small{display:block;color:var(--muted);font-size:11px;line-height:1.3}.secure{font-size:12px;color:var(--green);border:1px solid #244d49;background:#12302d;padding:4px 10px;border-radius:30px}.shell{max-width:1180px;padding:28px 24px 48px;margin:auto}.hero{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{font-size:11px;color:var(--blue);letter-spacing:1.8px;font-weight:700;text-transform:uppercase}.hero h1{margin:4px 0 8px;font-size:28px;line-height:1.3;letter-spacing:-.8px}.hero p{color:var(--muted);margin:0;max-width:540px}.navigation{display:flex;gap:5px;background:#111c30;border:1px solid var(--line);border-radius:14px;padding:5px;margin:0 0 24px}.navigation a{padding:10px 16px;border-radius:9px;color:var(--muted);font-size:13px;font-weight:600}.navigation a:hover{background:#223753;color:var(--text)}section{border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(120deg,#152238bb,#111c30);padding:22px;margin:0 0 20px;scroll-margin-top:88px}.section-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:17px}.section-header h2{font-size:18px;margin:0;letter-spacing:-.3px}.section-header p{margin:4px 0 0;color:var(--muted);font-size:12px}.tag{padding:3px 9px;border:1px solid #34567b;color:#a5c9f5;border-radius:7px;font-size:11px;white-space:nowrap}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}.span-all{grid-column:1/-1}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:9px}.toolbar>*{flex:0 0 auto}.toolbar input{flex:1 1 180px}.action-row{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-top:18px;padding-top:17px;border-top:1px solid var(--line)}.hint{font-size:12px;color:var(--muted);margin:10px 0 0}.message{font-size:13px;color:#bed5fa;overflow-wrap:anywhere;margin:12px 0 0;white-space:pre-wrap}.message:empty{display:none}.subpanel{margin-top:18px;padding-top:15px;border-top:1px solid var(--line)}details>summary{cursor:pointer;min-height:42px;display:list-item;color:#a6c8f5;font-weight:600;font-size:13px;list-style-position:inside}details[open]>summary{margin-bottom:15px}.reveal{margin-top:17px;background:#0e182a;border:1px solid #273953;border-radius:12px;padding:12px 14px}.table-wrap{overflow-x:auto;width:100%;border:1px solid var(--line);border-radius:12px;background:#0d1728}table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}th{background:#1a2940;color:#91a9c7;font-size:11px;font-weight:600;letter-spacing:.3px;white-space:nowrap}th,td{padding:13px 12px;border-bottom:1px solid #25344b;vertical-align:middle}tr:last-child td{border-bottom:0}td{overflow-wrap:anywhere}td button{padding:6px 9px;min-height:34px;font-size:12px;margin:2px}.status-pill.running{background:#123a32;border-color:#2e6656;color:#89e1bf}.status-pill.offline{background:#2d2733;border-color:#584255;color:#d0a6b8}.status-pill{display:inline-block;padding:3px 8px;border-radius:6px;border:1px solid #34506c;background:#193348;color:#a7cee9;font-size:11px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;background:#0a1321;color:#b6c9e4;border:1px solid #263950;border-radius:12px;padding:14px;max-height:260px;overflow:auto;margin:14px 0 0}pre:empty{display:none}.pagination{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px}.pagination span{font-size:12px;color:var(--muted)}.two-columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.two-columns section{min-width:0}.footnote{font-size:11px;color:#7186a3;text-align:center;padding:8px}dialog{border:1px solid #3c5578;border-radius:18px;background:#142139;color:var(--text);width:min(420px,calc(100% - 32px));padding:24px}dialog::backdrop{background:#030814c9;backdrop-filter:blur(5px)}dialog input{margin:10px 0 15px}dialog h2{font-size:18px;margin:0}#dnsconfigs p{background:#0e182a;border:1px solid var(--line);border-radius:11px;padding:12px;overflow-wrap:anywhere}#dnsconfigs button{margin:9px 6px 0 0;font-size:12px;padding:7px 10px}#cfkeyfields,#alikeyfields{min-width:0}#alikeyfields:not([hidden]){display:grid;gap:14px}[hidden]{display:none!important}.metric-note{color:var(--muted);font-size:12px;margin:0}.desktop-note{color:var(--muted);font-size:12px}.step-number{font-size:12px;color:#9ec3ff;background:#203b60;border:1px solid #335a89;border-radius:7px;padding:2px 7px;margin-right:7px}
+:root{color-scheme:dark;--bg:#0b1120;--surface:#111c30;--raised:#18263e;--line:#283953;--text:#e8eef9;--muted:#9aaec8;--blue:#5499ff;--green:#5ed5b0;--red:#ff939d;--radius:18px}*{box-sizing:border-box}html{scroll-behavior:smooth;scroll-padding-top:90px}body{margin:0;background:radial-gradient(ellipse at 5% 0%,#152a49 0,transparent 45%),var(--bg);color:var(--text);font:14px/1.6 system-ui,-apple-system,"Segoe UI",sans-serif}button,input,select{font:inherit}button{cursor:pointer;min-height:42px;padding:9px 15px;border:1px solid var(--line);border-radius:11px;background:var(--raised);color:var(--text);font-weight:600;transition:background .15s,border-color .15s}button:hover:not(:disabled){background:#223753;border-color:#5e7fa9}button:disabled{opacity:.4;cursor:not-allowed}.primary{background:#397eea;border-color:#397eea;color:#fff}.primary:hover:not(:disabled){background:#4b90fc}.danger{color:var(--red)}a{color:inherit;text-decoration:none}button,input,select,a,summary{-webkit-tap-highlight-color:transparent}button:focus-visible,input:focus-visible,select:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--blue);outline-offset:3px}input,select{min-width:0;width:100%;min-height:44px;background:#0d1728;border:1px solid #344763;border-radius:10px;padding:10px 12px;color:var(--text);font-size:16px}input::placeholder{color:#8194ad}input[type=checkbox]{width:19px;min-height:19px;height:19px;flex-shrink:0;accent-color:#548ff4;margin:0}label{display:flex;flex-direction:column;gap:7px;color:var(--muted);font-size:13px}.check{display:flex;flex-direction:row;align-items:center;gap:10px;min-height:44px;color:var(--text)}.topbar{position:sticky;top:0;z-index:20;background:#0b1120ed;border-bottom:1px solid #24354f;backdrop-filter:blur(16px)}.top-inner{max-width:1180px;margin:auto;padding:15px 24px;display:flex;justify-content:space-between;align-items:center;gap:16px}.brand{display:flex;align-items:center;gap:12px}.brand-mark{width:38px;height:38px;display:grid;place-items:center;background:#23457a;border:1px solid #3c6eb4;border-radius:12px;color:#a9ceff;font-weight:800;font-size:20px}.brand strong{font-size:16px;letter-spacing:.2px}.brand small{display:block;color:var(--muted);font-size:11px;line-height:1.3}.secure{font-size:12px;color:var(--green);border:1px solid #244d49;background:#12302d;padding:4px 10px;border-radius:30px}.shell{max-width:1180px;padding:28px 24px 48px;margin:auto}.hero{display:flex;align-items:flex-start;justify-content:space-between;gap:20px;margin-bottom:24px}.eyebrow{font-size:11px;color:var(--blue);letter-spacing:1.8px;font-weight:700;text-transform:uppercase}.hero h1{margin:4px 0 8px;font-size:28px;line-height:1.3;letter-spacing:-.8px}.hero p{color:var(--muted);margin:0;max-width:540px}.navigation{display:flex;gap:5px;background:#111c30;border:1px solid var(--line);border-radius:14px;padding:5px;margin:0 0 24px}.navigation a{padding:10px 16px;border-radius:9px;color:var(--muted);font-size:13px;font-weight:600}.navigation a:hover{background:#223753;color:var(--text)}section{border:1px solid var(--line);border-radius:var(--radius);background:linear-gradient(120deg,#152238bb,#111c30);padding:22px;margin:0 0 20px;scroll-margin-top:88px}.section-header{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:17px}.section-header h2{font-size:18px;margin:0;letter-spacing:-.3px}.section-header p{margin:4px 0 0;color:var(--muted);font-size:12px}.tag{padding:3px 9px;border:1px solid #34567b;color:#a5c9f5;border-radius:7px;font-size:11px;white-space:nowrap}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}.grid.three{grid-template-columns:repeat(3,minmax(0,1fr))}.span-all{grid-column:1/-1}.toolbar{display:flex;align-items:center;flex-wrap:wrap;gap:9px}.toolbar>*{flex:0 0 auto}.toolbar input{flex:1 1 180px}.action-row{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:12px;margin-top:18px;padding-top:17px;border-top:1px solid var(--line)}.hint{font-size:12px;color:var(--muted);margin:10px 0 0}.message{font-size:13px;color:#bed5fa;overflow-wrap:anywhere;margin:12px 0 0;white-space:pre-wrap}.message:empty{display:none}.subpanel{margin-top:18px;padding-top:15px;border-top:1px solid var(--line)}details>summary{cursor:pointer;min-height:42px;display:list-item;color:#a6c8f5;font-weight:600;font-size:13px;list-style-position:inside}details[open]>summary{margin-bottom:15px}.reveal{margin-top:17px;background:#0e182a;border:1px solid #273953;border-radius:12px;padding:12px 14px}.table-wrap{overflow-x:auto;width:100%;border:1px solid var(--line);border-radius:12px;background:#0d1728}table{width:100%;border-collapse:collapse;text-align:left;font-size:13px}th{background:#1a2940;color:#91a9c7;font-size:11px;font-weight:600;letter-spacing:.3px;white-space:nowrap}th,td{padding:13px 12px;border-bottom:1px solid #25344b;vertical-align:middle}tr:last-child td{border-bottom:0}td{overflow-wrap:anywhere}td button{padding:6px 9px;min-height:34px;font-size:12px;margin:2px}.status-pill.running{background:#123a32;border-color:#2e6656;color:#89e1bf}.status-pill.offline{background:#2d2733;border-color:#584255;color:#d0a6b8}.status-pill{display:inline-block;padding:3px 8px;border-radius:6px;border:1px solid #34506c;background:#193348;color:#a7cee9;font-size:11px}pre{white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.7 ui-monospace,SFMono-Regular,Consolas,monospace;background:#0a1321;color:#b6c9e4;border:1px solid #263950;border-radius:12px;padding:14px;max-height:260px;overflow:auto;margin:14px 0 0}pre:empty{display:none}.pagination{display:flex;align-items:center;justify-content:center;gap:10px;margin-top:12px}.pagination span{font-size:12px;color:var(--muted)}.two-columns{display:grid;grid-template-columns:1fr 1fr;gap:20px}.two-columns section{min-width:0}.footnote{font-size:11px;color:#7186a3;text-align:center;padding:8px}dialog{border:1px solid #3c5578;border-radius:18px;background:#142139;color:var(--text);width:min(420px,calc(100% - 32px));padding:24px}dialog::backdrop{background:#030814c9;backdrop-filter:blur(5px)}dialog input{margin:10px 0 15px}dialog h2{font-size:18px;margin:0}.billing-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin-top:14px}.balance-card{min-width:0;padding:15px 16px;border:1px solid #345176;border-radius:14px;background:linear-gradient(135deg,#152b49,#102039 68%,#142a39)}.balance-card span,.balance-card small{display:block;color:var(--muted);font-size:11px}.balance-card strong{display:block;color:#dcf5ff;font-size:22px;line-height:1.3;margin:7px 0;font-variant-numeric:tabular-nums}.balance-card small{overflow-wrap:anywhere}.balance-card:first-child strong{color:#91e1c6}#node{min-height:170px;padding:7px}#node option{padding:7px;border-radius:6px}section{box-shadow:0 8px 24px #02081722;transition:border-color .2s,transform .2s}section:focus-within{border-color:#385578}#dnsconfigs p{background:#0e182a;border:1px solid var(--line);border-radius:11px;padding:12px;overflow-wrap:anywhere}#dnsconfigs button{margin:9px 6px 0 0;font-size:12px;padding:7px 10px}#cfkeyfields,#alikeyfields{min-width:0}#alikeyfields:not([hidden]){display:grid;gap:14px}[hidden]{display:none!important}.metric-note{color:var(--muted);font-size:12px;margin:0}.desktop-note{color:var(--muted);font-size:12px}.step-number{font-size:12px;color:#9ec3ff;background:#203b60;border:1px solid #335a89;border-radius:7px;padding:2px 7px;margin-right:7px}
 @media(min-width:900px){#deploy .grid{grid-template-columns:1fr 1fr}.hero h1{font-size:32px}}
 @media(max-width:700px){html{scroll-padding-top:78px}.top-inner{padding:12px 16px}.secure{font-size:10px}.shell{padding:22px 14px calc(95px + env(safe-area-inset-bottom))}.hero{margin-bottom:20px;gap:12px}.hero h1{font-size:25px}.hero p{font-size:12px}.hero>button{min-height:40px;padding:8px 12px;white-space:nowrap}.navigation{position:fixed;bottom:0;left:0;right:0;z-index:30;margin:0;border-radius:0;border-width:1px 0 0;background:#101c30f5;backdrop-filter:blur(18px);padding:7px 8px calc(7px + env(safe-area-inset-bottom));justify-content:space-around}.navigation a{padding:9px 8px;text-align:center;font-size:12px;flex:1}.grid,.grid.three,.two-columns{grid-template-columns:1fr}.two-columns{gap:0}section{padding:18px 15px;margin-bottom:16px;border-radius:15px}.section-header h2{font-size:17px}.section-header{margin-bottom:15px}.tag{font-size:10px}.toolbar{gap:8px}.toolbar button{flex:1 1 auto}.action-row .primary{width:100%;min-height:47px}.action-row{gap:8px}.table-wrap{border:0;background:none;overflow:visible}#instances table,#instances tbody{display:block}#instances table>tr:first-child,#instances thead{display:none}#instances tr{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;background:#0d1728;border:1px solid #2b3d58;border-radius:12px;padding:15px;margin-bottom:12px}#instances tr:first-child{display:none}#instances td{display:block;border:0!important;padding:0;font-size:13px;min-width:0}#instances td:before{content:attr(data-label);display:block;color:#7f96b5;font-size:10px;margin-bottom:4px}#instances td:nth-child(3){font-weight:600}#instances td:last-child{grid-column:1/-1;padding-top:10px;border-top:1px solid #24344e!important;display:flex;flex-wrap:wrap;gap:6px}#instances td:last-child:before{display:none}#instances td button{flex:1 1 28%;margin:0;min-height:44px}#nodes th,#nodes td{padding:10px 8px;font-size:12px}.desktop-note{display:none}.pagination{gap:7px}.pagination button{padding:8px 10px;font-size:12px}.pagination span{font-size:11px}pre{max-height:220px;font-size:11px}.section-header>.primary{font-size:12px;padding:7px 11px}.brand strong{font-size:14px}}
-@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}button{transition:none}}
+.monitor-toolbar{margin:4px 0 12px}.monitor-toolbar label{width:min(100%,360px)}.metric-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(145px,1fr));gap:10px}.monitor-instance{margin-top:12px;padding:15px;border:1px solid var(--line);border-radius:14px;background:#0e182a}.monitor-title{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px}.monitor-title small{color:var(--muted);font-size:11px}.metric-card{min-width:0;padding:13px;border:1px solid #2a405e;border-radius:11px;background:linear-gradient(135deg,#162943,#111d31)}.metric-card span{display:block;color:var(--muted);font-size:11px}.metric-card strong{display:block;margin-top:5px;color:#d8eaff;font-size:18px;font-variant-numeric:tabular-nums;overflow-wrap:anywhere}.metric-card:nth-child(4) strong{color:#81d7bd}.metric-card:nth-child(5) strong{color:#91baff}.monitor-error{padding:10px 12px;border:1px solid #70414b;border-radius:9px;background:#301c27;color:#ffb2b9;font-size:12px;overflow-wrap:anywhere}@media(max-width:620px){.monitor-title{align-items:flex-start;flex-direction:column}.metric-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.metric-card strong{font-size:16px}}@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}button{transition:none}}
 </style></head><body>
 <header class="topbar"><div class="top-inner"><a class="brand" href="#overview"><span class="brand-mark">L</span><span><strong>Linode 节点管理</strong><small>CLOUD &amp; NODE CONSOLE</small></span></a><span class="secure">● 已登录</span></div></header>
 <main class="shell">
 <div class="hero"><div><span class="eyebrow">YOUR CLOUD WORKSPACE</span><h1>服务器与节点，一处管理</h1><p>管理 Linode 实例、同步 wp2 节点，自动完成后端部署。</p></div><button onclick="load();monitor()">↻ 刷新</button></div>
 <nav class="navigation" aria-label="快捷导航"><a href="#overview">服务器</a><a href="#create">创建实例</a><a href="#wp2">wp2 节点</a><a href="#deploy">自动部署</a><a href="#dns">设置</a></nav>
 <section id="overview"><div class="section-header"><div><h2>Linode 账号</h2><p>先选择账号，再管理对应的服务器</p></div><span class="tag">多账号</span></div>
-<label>当前账号<select id="account" onchange="load();monitor();proxyStatus()"><option value="">全部账号（仅查看）</option></select></label><p id="accountmsg" class="message"></p>
-<details class="subpanel"><summary>管理账号与 API 代理</summary><div class="grid"><label>账号备注<input id="accountname" maxlength="80" placeholder="例如：日本节点账号"></label><label>Linode API Token<input id="accounttoken" type="password" placeholder="仅保存到服务器，加密存储" autocomplete="off"></label></div><div class="toolbar" style="margin-top:12px"><button class="primary" onclick="addAccount()">添加账号</button><button class="danger" onclick="deleteAccount()">移除所选账号</button></div><p class="hint">移除账号只删除本地凭据，不删除云服务器。</p>
+<label>当前账号<select id="account" onchange="load();monitor();proxyStatus();queryAccountBilling()"><option value="">全部账号（仅查看）</option></select></label><p id="accountmsg" class="message"></p>
+<details class="subpanel"><summary>管理账号、余额与 API 代理</summary><div class="grid"><label>账号备注<input id="accountname" maxlength="80" placeholder="例如：日本节点账号"></label><label>Linode API Token<input id="accounttoken" type="password" placeholder="仅保存到服务器，加密存储" autocomplete="off"></label></div><div class="toolbar" style="margin-top:12px"><button class="primary" onclick="addAccount()">添加账号</button><button class="danger" onclick="deleteAccount()">删除所选账号</button><button onclick="queryAccountBilling()">查询余额 / $100 赠金</button></div><p class="hint">删除只移除面板中保存的账号凭据，不会删除 Linode 云服务器。余额查询需要 Linode Token 的 Account: Read Only / view_account 权限。</p><div id="billingcard" class="billing-grid"></div>
 <div class="subpanel"><label class="check"><input id="useproxy" type="checkbox" onchange="load()">Linode API 使用所选账号的代理</label><label>代理地址<input id="proxyurl" type="password" autocomplete="off" placeholder="http://用户:密码@主机:端口 或 socks5://主机:端口"></label><div class="toolbar" style="margin-top:12px"><button onclick="saveProxy()">加密保存代理</button><button class="danger" onclick="removeProxy()">删除代理</button></div><p id="proxystatus" class="message"></p><p class="hint">不勾选则直连；代理只用于 Linode API。</p></div></details></section>
 <section id="servers"><div class="section-header"><div><h2>服务器实例</h2><p id="msg" class="message">正在加载服务器…</p></div><button onclick="load()">↻ 刷新</button></div><div id="instances" class="table-wrap"></div></section>
 <section id="create"><div class="section-header"><div><h2>创建 Linode</h2><p>选择套餐与地区，确认费用后创建</p></div><span class="tag">新实例</span></div><div class="toolbar" style="margin-bottom:16px"><button onclick="catalogs()">加载地区、套餐和系统</button><span class="desktop-note">选项来自当前 Linode 账号</span></div><div class="grid"><label>服务器名称<input id="createlabel" placeholder="例如：jp-node-01" maxlength="64"></label><label>地区<select id="createregion"><option value="">请先加载选项</option></select></label><label>套餐<select id="createtype"><option value="">请先加载选项</option></select></label><label>系统镜像<select id="createimage"><option value="">请先加载选项</option></select></label><label class="span-all">Root 密码<input id="createpass" type="password" autocomplete="new-password" placeholder="至少 12 位，创建后加密保存"></label></div><div class="action-row"><label class="check"><input id="openallports" type="checkbox" checked>新实例默认放行全部端口</label><button class="primary" id="createbutton" onclick="createInstance()">创建并开机</button></div><p id="createmsg" class="message"></p></section>
 <section id="wp2"><div class="section-header"><div><h2>wp2 节点</h2><p>连接管理员账号，同步全部节点</p></div><button onclick="nodes()">↻ 同步节点</button></div><p id="wp2connection" class="message"></p><details class="subpanel"><summary>连接或更换 wp2 账号</summary><div class="grid"><label>管理员邮箱<input id="wp2email" type="email" autocomplete="username" placeholder="admin@example.com"></label><label>管理员密码<input id="wp2password" type="password" autocomplete="off" placeholder="密码仅用于本次登录"></label><label class="span-all">两步动态码（如启用）<input id="wp2code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位动态码"></label></div><div class="toolbar" style="margin-top:14px"><button class="primary" id="wp2connect" onclick="connectWP2()">连接 wp2</button><button class="danger" onclick="disconnectWP2()">断开连接</button></div><p class="hint">登录会话加密保存在管理机，密码不保存。</p></details><p id="nodehint" class="message">正在加载节点…</p><details class="reveal"><summary>浏览节点列表 · 搜索 / 分页</summary><input id="nodesearch" placeholder="搜索节点名称或 ID" aria-label="搜索节点" oninput="nodePage=0;renderNodes()"><div id="nodes" style="margin-top:12px"></div><div class="pagination"><button id="nodesprev" onclick="nodePage--;renderNodes()">上一页</button><span id="nodespage"></span><button id="nodesnext" onclick="nodePage++;renderNodes()">下一页</button></div></details></section>
-<section id="deploy"><div class="section-header"><div><h2>自动安装后端</h2><p>选择实例和节点，自动检查配置、证书与服务</p></div><span class="tag">XboardNode-Plus</span></div><p id="installaccount" class="message">请先选择 Linode 账号</p><div class="grid" style="margin-top:14px"><label><span><span class="step-number">1</span>安装到哪台服务器</span><select id="instance" onchange="updateDNSTarget()"><option value="">请先选择账号并加载服务器</option></select></label><label><span><span class="step-number">2</span>绑定哪个 wp2 节点</span><select id="node" onchange="updateDNSTarget()"><option value="">请先同步 wp2 节点</option></select></label></div><div class="action-row"><span class="desktop-note">DNS 自动解析按下方启用的域名配置匹配</span><div class="toolbar"><button onclick="backendLogs()" id="backendlogbutton">查看后端日志</button><button class="primary" id="installbutton" onclick="install()">自动安装并验证</button></div></div><pre id="joblog" aria-live="polite"></pre><button id="ipcleanup" hidden onclick="cleanupIPChange()">清理残留临时实例</button><details class="subpanel"><summary>最近换 IP 任务</summary><button onclick="loadIPChanges()">刷新任务</button><div id="ipchanges"></div></details><details class="subpanel"><summary>查询历史任务</summary><div class="toolbar"><input id="job" placeholder="任务 ID" aria-label="任务 ID"><button onclick="job()">查询任务</button></div></details></section>
+<section id="deploy"><div class="section-header"><div><h2>自动安装后端</h2><p>选择实例和节点，自动检查配置、证书与服务</p></div><span class="tag">XboardNode-Plus · VLESS anti-probe</span></div><p id="installaccount" class="message">请先选择 Linode 账号</p><div class="grid" style="margin-top:14px"><label><span><span class="step-number">1</span>安装到哪台服务器</span><select id="instance" onchange="updateDNSTarget()"><option value="">请先选择账号并加载服务器</option></select></label><label><span><span class="step-number">2</span>搜索并多选 wp2 节点</span><input id="nodefilter" type="search" placeholder="按名称、ID 或协议筛选" oninput="filterInstallNodes()"><select id="node" multiple size="7" aria-label="可多选 wp2 节点" onchange="rememberInstallNodes();updateDNSTarget()"><option value="">请先同步 wp2 节点</option></select><span id="selectednodes" class="hint">可一次选择多个节点安装到同一台服务器。</span></label></div><div class="action-row"><span class="desktop-note">DNS 自动解析按下方启用的域名配置匹配</span><div class="toolbar"><button onclick="backendLogs()" id="backendlogbutton">查看后端日志</button><button class="primary" id="installbutton" onclick="install()">自动安装并验证</button></div></div><pre id="joblog" aria-live="polite"></pre><button id="ipcleanup" hidden onclick="cleanupIPChange()">清理残留临时实例</button><details class="subpanel"><summary>最近换 IP 任务</summary><button onclick="loadIPChanges()">刷新任务</button><div id="ipchanges"></div></details><details class="subpanel"><summary>查询历史任务</summary><div class="toolbar"><input id="job" placeholder="任务 ID" aria-label="任务 ID"><button onclick="job()">查询任务</button></div></details></section>
 <section id="dns"><div class="section-header"><div><h2>DNS 自动解析与证书</h2><p>配置一次密钥，安装时按节点域名自动匹配</p></div><span class="tag">加密保存</span></div><p id="dnstarget" class="message">请选择安装目标服务器，DNS 将指向该实例公网 IP。</p><div id="dnsconfigs"></div><p id="dnsmsg" class="message"></p><details class="subpanel"><summary>添加 DNS 域名与密钥</summary><div class="grid"><label>DNS 服务商<select id="dnsprovider" onchange="dnsFields()"><option value="cloudflare">Cloudflare</option><option value="alidns">阿里云 DNS</option></select></label><label>托管域名<input id="dnszone" placeholder="填写 Key 后可自动读取，或手动填写"></label><div class="span-all"><div class="toolbar"><button id="dnsdiscover" onclick="discoverDNS()">读取托管域名并匹配节点</button><select id="dnszones" aria-label="已读取的托管域名" onchange="document.getElementById('dnszone').value=this.value"><option value="">先填写 Key，再读取域名</option></select></div></div><span id="cfkeyfields" class="span-all"><label>Cloudflare API Token<input id="dnstoken" type="password" autocomplete="off" placeholder="需要 Zone Read / DNS Edit 权限"></label></span><span id="alikeyfields" class="span-all" hidden><label>阿里云 AccessKey ID<input id="dnsaccessid" type="password" autocomplete="off" placeholder="RAM AccessKey ID"></label><label>阿里云 AccessKey Secret<input id="dnssecret" type="password" autocomplete="off" placeholder="RAM AccessKey Secret"></label></span></div><div class="action-row"><label class="check"><input id="dnsenabled" type="checkbox" checked>安装时自动更新 DNS</label><button class="primary" onclick="saveDNS()">加密保存 DNS 配置</button></div><p class="hint">只更新节点子域名 A/AAAA；Cloudflare 使用灰云。根域名、面板地址和 CNAME 不自动修改。</p></details></section>
-<section id="telegram"><div class="section-header"><div><h2>Telegram 提醒</h2><p>直接配置机器人，接收监控异常与恢复通知</p></div><span class="tag">消息通知</span></div><p id="tgstatus" class="message"></p><details class="subpanel"><summary>设置机器人与接收聊天</summary><div class="grid"><label>Bot Token<input id="tgtoken" type="password" autocomplete="off" placeholder="由 BotFather 获取；留空保留已保存 Token"></label><label>Chat ID<input id="tgchat" placeholder="个人 ID、群组负数 ID 或 @频道用户名"></label></div><div class="action-row"><label class="check"><input id="tgenabled" type="checkbox" checked>启用 Telegram 提醒</label><button class="primary" onclick="saveTelegram()">加密保存</button></div><p class="hint">个人聊天请先向机器人发送 /start；群组或频道需允许机器人发消息。告警依赖资源监控运行。</p></details><div class="toolbar" style="margin-top:14px"><button id="tgtest" onclick="testTelegram()">发送测试消息</button><button class="danger" onclick="removeTelegram()">移除网页配置</button></div><p id="tgmsg" class="message"></p></section><section id="monitor"><div class="section-header"><div><h2>资源监控</h2><p>CPU / 内存 / 磁盘 · 数据来自 SSH 监控</p></div><button onclick="monitor()">↻ 刷新</button></div><pre id="metrics"></pre></section>
+<section id="telegram"><div class="section-header"><div><h2>Telegram 提醒</h2><p>直接配置机器人，接收监控异常与恢复通知</p></div><span class="tag">消息通知</span></div><p id="tgstatus" class="message"></p><details class="subpanel"><summary>设置机器人与接收聊天</summary><div class="grid"><label>Bot Token<input id="tgtoken" type="password" autocomplete="off" placeholder="由 BotFather 获取；留空保留已保存 Token"></label><label>Chat ID<input id="tgchat" placeholder="个人 ID、群组负数 ID 或 @频道用户名"></label></div><div class="action-row"><label class="check"><input id="tgenabled" type="checkbox" checked>启用 Telegram 提醒</label><button class="primary" onclick="saveTelegram()">加密保存</button></div><p class="hint">个人聊天请先向机器人发送 /start；群组或频道需允许机器人发消息。告警依赖资源监控运行。</p></details><div class="toolbar" style="margin-top:14px"><button id="tgtest" onclick="testTelegram()">发送测试消息</button><button class="danger" onclick="removeTelegram()">移除网页配置</button></div><p id="tgmsg" class="message"></p></section><section id="monitor"><div class="section-header"><div><h2>资源监控</h2><p>CPU / 内存 / 磁盘与网卡流量 · 速率为实时采样，累计流量为系统网卡计数</p></div><span class="tag">SSH 采样</span></div><div class="toolbar monitor-toolbar"><label>实时采样实例<select id="monitorinstance" aria-label="实时采样实例"><option value="">请先选择 Linode 账号</option></select></label><button onclick="monitor()">显示监控</button><button class="primary" id="monitorrefresh" onclick="refreshMonitor()">立即采样</button></div><p id="monitorhint" class="message" aria-live="polite"></p><div id="metrics" class="metric-grid"></div></section>
 <p class="footnote">Linode Node Manager · 通过 HTTPS 访问 · 凭据加密存储</p>
 </main>
 <dialog id="ipchangedialog"><h2>保留原机 · 更换公网 IPv4</h2><p id="ipsummary" class="message"></p><p class="hint">会创建同地区临时实例取得新 IP，短暂关闭原机、交换 IPv4、恢复原机，再清理临时实例。原机磁盘、密码和后端配置保留。新 IP 是否可用需由你的网络验证。</p><label>临时实例套餐（会计费）<select id="ipplan"></select></label><label style="margin-top:12px">换 IP 后同步哪个 wp2 节点<select id="ipnode"></select></label><p class="hint">不选节点则不自动更新 DNS。套餐价格为参考，地区和最终账单以 Linode 为准。</p><label class="check"><input id="ipbilling" type="checkbox">我确认临时实例费用和短暂关机</label><p id="iperror" class="message"></p><div class="toolbar"><button class="primary" id="ipconfirm" onclick="startIPChange()">确认换 IP</button><button onclick="document.getElementById('ipchangedialog').close()">取消</button></div></dialog>
 <dialog id="passworddialog" onclose="document.getElementById('savedpassword').value=''"><h2>Root 密码</h2><p class="hint">仅在此处显示，关闭后清空</p><input id="savedpassword" type="text" readonly autocomplete="off" aria-label="已保存的 Root 密码"><button onclick="document.getElementById('passworddialog').close()">关闭并清除</button></dialog>
-<script>async function api(path,options={}){if(path==='/instances'||path.startsWith('/instances/')||path==='/deployments/install'||path.startsWith('/catalog/')||path==='/linode/proxy'){let a=document.getElementById('account').value;if(a&&!path.includes('account_id='))path+=(path.includes('?')?'&':'?')+'account_id='+encodeURIComponent(a);if(document.getElementById('useproxy').checked&&path!='/linode/proxy'&&!path.startsWith('/linode/proxy?'))path+=(path.includes('?')?'&':'?')+'use_proxy=true'}let r=await fetch('/api'+path,{...options,credentials:'same-origin',headers:{'Content-Type':'application/json'}});let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}async function loadAccounts(){let box=document.getElementById('account'),old=box.value;try{let data=await api('/accounts');box.replaceChildren();let all=document.createElement('option');all.value='';all.textContent='全部账号（仅查看）';box.appendChild(all);for(let a of data.accounts){let o=document.createElement('option');o.value=a.id;o.textContent=a.name;box.appendChild(o)}box.value=old&&Array.from(box.options).some(o=>o.value===old)?old:(data.accounts.length===1?data.accounts[0].id:'');document.getElementById('accountmsg').textContent='已加载 '+data.accounts.length+' 个账号'}catch(e){document.getElementById('accountmsg').textContent=e.message}}
+<script>async function api(path,options={}){if(path.startsWith('/monitor/refresh')||path==='/instances'||path.startsWith('/instances/')||path==='/deployments/install'||path.startsWith('/catalog/')||path==='/linode/proxy'||(path.startsWith('/accounts/')&&path.includes('/billing'))){let a=document.getElementById('account').value;if(a&&!path.includes('account_id='))path+=(path.includes('?')?'&':'?')+'account_id='+encodeURIComponent(a);if(document.getElementById('useproxy').checked&&path!='/linode/proxy'&&!path.startsWith('/linode/proxy?'))path+=(path.includes('?')?'&':'?')+'use_proxy=true'}let r=await fetch('/api'+path,{...options,credentials:'same-origin',headers:{'Content-Type':'application/json'}});let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}async function loadAccounts(){let box=document.getElementById('account'),old=box.value;try{let data=await api('/accounts');box.replaceChildren();let all=document.createElement('option');all.value='';all.textContent='全部账号（仅查看）';box.appendChild(all);for(let a of data.accounts){let o=document.createElement('option');o.value=a.id;o.textContent=a.name;box.appendChild(o)}box.value=old&&Array.from(box.options).some(o=>o.value===old)?old:(data.accounts.length===1?data.accounts[0].id:'');document.getElementById('accountmsg').textContent='已加载 '+data.accounts.length+' 个账号'}catch(e){document.getElementById('accountmsg').textContent=e.message}}
 async function addAccount(){let name=document.getElementById('accountname').value.trim(),token=document.getElementById('accounttoken').value;if(!name||token.length<20){document.getElementById('accountmsg').textContent='请输入账号备注和有效 Token';return}try{let a=await api('/accounts',{method:'POST',body:JSON.stringify({name,token})});document.getElementById('accounttoken').value='';await loadAccounts();document.getElementById('account').value=a.id;await load();document.getElementById('accountmsg').textContent='已添加：'+a.name}catch(e){document.getElementById('accountmsg').textContent=e.message}}
-async function deleteAccount(){let id=document.getElementById('account').value;if(!id){document.getElementById('accountmsg').textContent='请先选择要移除的 Linode 账号';return}if(!confirm('删除此账号凭据？不会删除 Linode 实例。'))return;try{await api('/accounts/'+encodeURIComponent(id),{method:'DELETE'});await loadAccounts();await load()}catch(e){document.getElementById('accountmsg').textContent=e.message}}
-const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function power(id,action){if(!document.getElementById('account').value){document.getElementById('msg').textContent='请先选择目标账号，不能在全部账号视图操作';return}if(!confirm('确认对实例 '+id+' 执行 '+action+'？'))return;try{const result=await api('/instances/'+id+'/'+action,{method:'POST'});await load();if(result.boot_job_id){document.getElementById('job').value=result.boot_job_id;watchJob(result.boot_job_id)}}catch(e){document.getElementById('msg').textContent=e.message}}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){const selectedAccount=document.getElementById('account').value;const target=document.getElementById('instance'),previous=installationAccount===selectedAccount?target.value:'';installationAccount='';target.replaceChildren();document.getElementById('instances').textContent='正在加载当前账号服务器…';updateDNSTarget();try{let d=await api('/instances');if(document.getElementById('account').value!==selectedAccount)return;updateInstallTargets(d.instances,selectedAccount,previous);document.getElementById('instances').innerHTML='<table><tr><th>Linode 账号</th><th>ID</th><th>名称</th><th>状态</th><th>IP 地址</th><th>地区 / 套餐</th><th>操作</th></tr>'+d.instances.map((i,index)=>'<tr><td data-label="账号">'+esc(accountLabel(i.account_id))+'</td><td data-label="实例 ID">'+Number(i.id)+'</td><td data-label="名称">'+esc(i.label)+'</td><td data-label="状态"><span class="status-pill '+esc(i.status)+'">'+esc(i.status)+'</span></td><td data-label="IP 地址">'+esc((i.ipv4||[]).join(', ')||'分配中')+(i.ipv6?'<br>'+esc(i.ipv6):'')+'</td><td data-label="地区 / 套餐">'+esc(i.region)+'<br>'+esc(i.type)+'</td><td><button '+(!selectedAccount||i.status!=='offline'?'disabled':'')+' onclick="power('+Number(i.id)+',\'boot\')">开机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'shutdown\')">关机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'reboot\')">重启</button><button data-action="password" data-index="'+index+'" '+(i.password_saved?'':'disabled')+'>查看密码</button><button data-action="changeip" data-index="'+index+'">更换 IPv4</button><button class="danger" data-action="delete" data-index="'+index+'">删除实例</button></td></tr>').join('')+'</table>';document.getElementById('instances').querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>instanceOperation(d.instances[Number(button.dataset.index)],button.dataset.action));document.getElementById('msg').textContent=d.instances.length?'已加载 '+d.instances.length+' 台；选择目标账号后可使用每行的开机、关机、重启按钮':'当前账号没有实例，请检查 Linode API Token 或选择其他账号'}catch(e){document.getElementById('msg').textContent='服务器列表加载失败：'+e.message}}async function nodes(){document.getElementById('nodehint').textContent='正在同步 wp2 节点…';try{let d=await api('/wp2/nodes');let a=d.nodes||[];let sel=document.getElementById('node');sel.replaceChildren();let empty=document.createElement('option');empty.value='';empty.textContent='请选择 wp2 节点';sel.appendChild(empty);for(let n of a){let o=document.createElement('option');o.value=String(n.id);o.textContent=String(n.name||'节点')+' (#'+n.id+')';sel.appendChild(o)}nodeCache=a;nodePage=0;renderNodes();document.getElementById('nodehint').textContent=a.length?'已同步 '+a.length+' 个节点；在线状态：待心跳接口验证':(d.warning||'wp2 接口返回 0 个节点，请检查 wp2 节点配置与 API 访问权限')}catch(e){nodeCache=[];nodePage=0;renderNodes();document.getElementById('node').replaceChildren();document.getElementById('nodehint').textContent='wp2 同步失败：'+e.message}}async function monitor(){try{let d=(await api('/monitor')).instances,id=document.getElementById('account').value;show('metrics',id?d.filter(i=>i.account_id===id):d)}catch(e){show('metrics',e.message)}}async function install(){
+async function deleteAccount(){let id=document.getElementById('account').value;if(!id){document.getElementById('accountmsg').textContent='请先选择要移除的 Linode 账号';return}if(!confirm('删除此账号凭据？不会删除 Linode 实例。'))return;try{await api('/accounts/'+encodeURIComponent(id),{method:'DELETE'});document.getElementById('billingcard').replaceChildren();await loadAccounts();await load()}catch(e){document.getElementById('accountmsg').textContent=e.message}}
+async function queryAccountBilling(){const id=document.getElementById('account').value,box=document.getElementById('billingcard');box.replaceChildren();if(!id){document.getElementById('accountmsg').textContent='请先从账号下拉框选择一个 Linode 账号，再查询余额。';return}document.getElementById('accountmsg').textContent='正在安全读取 Linode 余额与活动赠金…';try{const data=await api('/accounts/'+encodeURIComponent(id)+'/billing');const amount=value=>Number(value||0).toLocaleString('en-US',{style:'currency',currency:'USD'});const addCard=(title,value,detail)=>{const card=document.createElement('div');card.className='balance-card';const h=document.createElement('span');h.textContent=title;const strong=document.createElement('strong');strong.textContent=value;const note=document.createElement('small');note.textContent=detail||'';card.appendChild(h);card.appendChild(strong);card.appendChild(note);box.appendChild(card)};addCard('账户余额',amount(data.balance),'美元 USD · Linode account balance');addCard('本月预计费用',amount(data.balance_uninvoiced),'已产生但尚未结算的估算账单');for(const promo of data.active_promotions||[]){addCard(promo.summary||'活动赠金剩余',amount(promo.credit_remaining),'本月可用 '+amount(promo.this_month_credit_remaining)+(promo.credit_monthly_cap?' / 月度上限 '+amount(promo.credit_monthly_cap):'')+(promo.expire_dt?' · 到期 '+promo.expire_dt.slice(0,10):''))}document.getElementById('accountmsg').textContent='余额与赠金数据已更新；赠金按 Linode API 返回值显示。'}catch(e){document.getElementById('accountmsg').textContent=e.message}}
+const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function power(id,action){if(!document.getElementById('account').value){document.getElementById('msg').textContent='请先选择目标账号，不能在全部账号视图操作';return}if(!confirm('确认对实例 '+id+' 执行 '+action+'？'))return;try{const result=await api('/instances/'+id+'/'+action,{method:'POST'});await load();if(result.boot_job_id){document.getElementById('job').value=result.boot_job_id;watchJob(result.boot_job_id)}}catch(e){document.getElementById('msg').textContent=e.message}}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){const selectedAccount=document.getElementById('account').value;const target=document.getElementById('instance'),previous=installationAccount===selectedAccount?target.value:'';installationAccount='';target.replaceChildren();document.getElementById('instances').textContent='正在加载当前账号服务器…';updateDNSTarget();try{let d=await api('/instances');if(document.getElementById('account').value!==selectedAccount)return;updateInstallTargets(d.instances,selectedAccount,previous);updateMonitorInstances(d.instances,selectedAccount);document.getElementById('instances').innerHTML='<table><tr><th>Linode 账号</th><th>ID</th><th>名称</th><th>状态</th><th>IP 地址</th><th>地区 / 套餐</th><th>操作</th></tr>'+d.instances.map((i,index)=>'<tr><td data-label="账号">'+esc(accountLabel(i.account_id))+'</td><td data-label="实例 ID">'+Number(i.id)+'</td><td data-label="名称">'+esc(i.label)+'</td><td data-label="状态"><span class="status-pill '+esc(i.status)+'">'+esc(i.status)+'</span></td><td data-label="IP 地址">'+esc((i.ipv4||[]).join(', ')||'分配中')+(i.ipv6?'<br>'+esc(i.ipv6):'')+'</td><td data-label="地区 / 套餐">'+esc(i.region)+'<br>'+esc(i.type)+'</td><td><button '+(!selectedAccount||i.status!=='offline'?'disabled':'')+' onclick="power('+Number(i.id)+',\'boot\')">开机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'shutdown\')">关机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'reboot\')">重启</button><button data-action="password" data-index="'+index+'" '+(i.password_saved?'':'disabled')+'>查看密码</button><button data-action="changeip" data-index="'+index+'">更换 IPv4</button><button class="danger" data-action="delete" data-index="'+index+'">删除实例</button></td></tr>').join('')+'</table>';document.getElementById('instances').querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>instanceOperation(d.instances[Number(button.dataset.index)],button.dataset.action));document.getElementById('msg').textContent=d.instances.length?'已加载 '+d.instances.length+' 台；选择目标账号后可使用每行的开机、关机、重启按钮':'当前账号没有实例，请检查 Linode API Token 或选择其他账号'}catch(e){document.getElementById('msg').textContent='服务器列表加载失败：'+e.message}}async function nodes(){document.getElementById('nodehint').textContent='正在同步 wp2 节点…';try{let d=await api('/wp2/nodes');nodeCache=d.nodes||[];nodePage=0;filterInstallNodes();renderNodes();document.getElementById('nodehint').textContent=nodeCache.length?'已同步 '+nodeCache.length+' 个节点；可搜索并多选安装':(d.warning||'wp2 接口返回 0 个节点，请检查 wp2 节点配置与 API 访问权限')}catch(e){nodeCache=[];nodePage=0;selectedInstallNodeIDs.clear();renderNodes();filterInstallNodes();document.getElementById('nodehint').textContent='wp2 同步失败：'+e.message}}function updateMonitorInstances(instances,account){const select=document.getElementById('monitorinstance'),previous=select.value;select.replaceChildren();const available=account?instances.filter(i=>i.account_id===account):[];if(!available.length){const option=document.createElement('option');option.value='';option.textContent=account?'该账号没有可采样实例':'请先选择 Linode 账号';select.appendChild(option);select.disabled=true;return}select.disabled=false;for(const instance of available){const option=document.createElement('option');option.value=String(instance.id);option.textContent=(instance.label||'Linode')+' (#'+instance.id+') · '+instance.status;select.appendChild(option)}select.value=available.some(i=>String(i.id)===previous)?previous:String(available.find(i=>i.status==='running')?.id||available[0].id)}
+function humanBytes(value){const n=Number(value)||0;if(n<1024)return n.toFixed(0)+' B';const units=['KB','MB','GB','TB','PB'];let amount=n/1024,index=0;while(amount>=1024&&index<units.length-1){amount/=1024;index++}return amount.toFixed(2)+' '+units[index]}
+function renderMonitor(items){const root=document.getElementById('metrics');root.replaceChildren();if(!items.length){document.getElementById('monitorhint').textContent='暂无监控快照。选择账号后点“立即采样”；SSH 需要实例已开机并配置好登录密钥。';return}for(const item of items){const panel=document.createElement('div');panel.className='monitor-instance';const heading=document.createElement('div');heading.className='monitor-title';const title=document.createElement('strong');title.textContent=(item.label||'Linode')+' (#'+item.id+')';const stamp=document.createElement('small');stamp.textContent=item.updated_at?'更新于 '+new Date(item.updated_at).toLocaleString():'等待采样';heading.appendChild(title);heading.appendChild(stamp);panel.appendChild(heading);if(item.monitor_error){const error=document.createElement('p');error.className='monitor-error';error.textContent='采样失败：'+item.monitor_error;panel.appendChild(error);root.appendChild(panel);continue}const cards=[['CPU',Number(item.cpu||0).toFixed(1)+'%'],['内存',Number(item.memory||0).toFixed(1)+'%'],['磁盘',Number(item.disk||0).toFixed(1)+'%'],['下载速率',Number(item.download_mbps||0).toFixed(3)+' Mbps'],['上传速率',Number(item.upload_mbps||0).toFixed(3)+' Mbps'],['累计下载',humanBytes(item.download_bytes)],['累计上传',humanBytes(item.upload_bytes)],['后端服务',item.service||'未知'],['网卡',item.network_interface||'未知']];const grid=document.createElement('div');grid.className='metric-grid';for(const [name,value] of cards){const card=document.createElement('div');card.className='metric-card';const label=document.createElement('span');label.textContent=name;const strong=document.createElement('strong');strong.textContent=value;card.appendChild(label);card.appendChild(strong);grid.appendChild(card)}panel.appendChild(grid);root.appendChild(panel)}document.getElementById('monitorhint').textContent='速率为本次 SSH 采样窗口内的瞬时值；累计值从系统启动或网卡计数器重置开始，不等同于 Linode 月度流量账单。'}
+async function monitor(){try{const d=await api('/monitor'),account=document.getElementById('account').value;renderMonitor(account?(d.instances||[]).filter(i=>i.account_id===account):[])}catch(e){document.getElementById('monitorhint').textContent='读取监控失败：'+e.message}}
+async function refreshMonitor(){const button=document.getElementById('monitorrefresh'),account=document.getElementById('account').value,id=document.getElementById('monitorinstance').value;if(!account){document.getElementById('monitorhint').textContent='请先选择 Linode 账号。';return}if(!id){document.getElementById('monitorhint').textContent='该账号没有可采样实例。';return}if(button.disabled)return;button.disabled=true;document.getElementById('monitorhint').textContent='正在通过 SSH 采样，通常需要数秒…';try{const item=await api('/monitor/refresh?instance_id='+encodeURIComponent(id));renderMonitor([item])}catch(e){document.getElementById('monitorhint').textContent='立即采样失败：'+e.message}finally{button.disabled=false}}async function install(){
  const button=document.getElementById('installbutton'),account=document.getElementById('account'),instance=document.getElementById('instance'),node=document.getElementById('node');
  if(button.disabled)return;
  if(!account.value){show('joblog','请先选择目标 Linode 账号');return}
  if(installationAccount!==account.value||!Number.isInteger(Number(instance.value))||Number(instance.value)<=0){show('joblog','请选择该账号下运行中的 Linode 服务器');return}
- if(!node.value){show('joblog','请先同步并选择 wp2 节点');return}
- if(!confirm('确认自动安装后端？\nLinode 账号：'+accountLabel(account.value)+'\n服务器：'+instance.selectedOptions[0].textContent+'\nwp2 节点：'+node.selectedOptions[0].textContent+'\n将自动检查配置、申请证书并启用服务；再次安装会重启后端。如匹配已启用的 DNS 配置，会更新该节点子域名 A/AAAA、移除无对应 IPv6 的旧 AAAA，Cloudflare 改为灰云。'))return;
+ const targetIDs=Array.from(selectedInstallNodeIDs).map(Number).filter(id=>Number.isInteger(id)&&id>0);
+ if(!targetIDs.length){show('joblog','请先搜索并选择一个或多个 wp2 节点');return}
+ const selectedLabels=nodeCache.filter(n=>targetIDs.includes(Number(n.id))).map(n=>String(n.name||'节点')+' (#'+n.id+')').join('、');
+ if(!confirm('确认自动安装后端？\nLinode 账号：'+accountLabel(account.value)+'\n服务器：'+instance.selectedOptions[0].textContent+'\nwp2 节点（'+targetIDs.length+'个）：'+selectedLabels+'\n将保留同机其他节点配置，只替换本次所选节点。服务可能会短暂重启；如启用 DNS 配置，会逐个更新并验证所选节点的解析。'))return;
  button.disabled=true;
- try{const result=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(instance.value),mode:'node',target_id:Number(node.value)})});document.getElementById('job').value=result.job_id;show('joblog',result);watchJob(result.job_id)}catch(e){button.disabled=false;show('joblog',e.message)}
+ try{const result=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(instance.value),mode:'node',target_ids:targetIDs,target_id:targetIDs[0]})});document.getElementById('job').value=result.job_id;show('joblog',result);watchJob(result.job_id)}catch(e){button.disabled=false;show('joblog',e.message)}
 }
 async function job(){try{showJob(await api('/deployments/'+encodeURIComponent(document.getElementById('job').value)))}catch(e){show('joblog',e.message)}}
 
@@ -827,7 +1009,7 @@ async function connectWP2(){
  if(button.disabled)return;button.disabled=true;message.textContent='正在登录并验证管理员权限…';
  try{await api('/wp2/session',{method:'POST',body:JSON.stringify({email:document.getElementById('wp2email').value,password:password.value,code:code.value})});message.textContent='wp2 已连接';await nodes()}catch(e){message.textContent=e.message}finally{password.value='';code.value='';button.disabled=false}
 }
-async function disconnectWP2(){try{await api('/wp2/session',{method:'DELETE'});await wp2Connection();nodeCache=[];nodePage=0;renderNodes();document.getElementById('node').replaceChildren();document.getElementById('nodehint').textContent='已断开，下次同步将使用 muKey 接口'}catch(e){document.getElementById('wp2connection').textContent=e.message}}
+async function disconnectWP2(){try{await api('/wp2/session',{method:'DELETE'});await wp2Connection();nodeCache=[];nodePage=0;renderNodes();nodeCache=[];selectedInstallNodeIDs.clear();filterInstallNodes();document.getElementById('nodehint').textContent='已断开，下次同步将使用 muKey 接口'}catch(e){document.getElementById('wp2connection').textContent=e.message}}
 
 let installationAccount='',installationTargets=[];
 function accountLabel(id){const option=Array.from(document.getElementById('account').options).find(x=>x.value===id);return option?option.textContent:id}
@@ -851,7 +1033,9 @@ async function removeProxy(){try{await api('/linode/proxy',{method:'DELETE'});do
 let watchedJob='';
 async function watchJob(id){watchedJob=id;const button=document.getElementById('installbutton');button.disabled=true;try{while(watchedJob===id){const result=await api('/deployments/'+encodeURIComponent(id));showJob(result);if(['success','failed','partial','interrupted'].includes(result.status)){if(result.status==='success'&&!result.kind)button.textContent='重新安装（会重启后端）';break;}await new Promise(resolve=>setTimeout(resolve,2500))}}catch(e){show('joblog',e.message)}finally{if(watchedJob===id){watchedJob='';button.disabled=false}}}
 
-let nodeCache=[],nodePage=0;
+let nodeCache=[],nodePage=0,selectedInstallNodeIDs=new Set();
+function rememberInstallNodes(){const select=document.getElementById('node'),visible=new Set(Array.from(select.options).map(option=>option.value));for(const id of visible)selectedInstallNodeIDs.delete(id);for(const option of select.selectedOptions)if(option.value)selectedInstallNodeIDs.add(option.value);document.getElementById('selectednodes').textContent=selectedInstallNodeIDs.size?'已选择 '+selectedInstallNodeIDs.size+' 个节点；可按住 Ctrl / ⌘ 多选':'可一次选择多个节点安装到同一台服务器。'}
+function filterInstallNodes(){const select=document.getElementById('node');const query=document.getElementById('nodefilter').value.trim().toLowerCase();select.replaceChildren();const empty=document.createElement('option');empty.value='';empty.textContent=query?'搜索结果（可多选）':'请选择一个或多个节点';empty.disabled=true;select.appendChild(empty);for(const n of nodeCache.filter(n=>[n.id,n.name,n.sort].some(v=>String(v||'').toLowerCase().includes(query)))){const option=document.createElement('option');option.value=String(n.id);option.textContent=String(n.name||'节点')+' (#'+n.id+') · '+String(n.sort||'未知协议');option.selected=selectedInstallNodeIDs.has(option.value);select.appendChild(option)}rememberInstallNodes()}
 function renderNodes(){
  const query=document.getElementById('nodesearch').value.trim().toLowerCase();
  const matches=nodeCache.filter(node=>String(node.id).includes(query)||String(node.name||'').toLowerCase().includes(query));

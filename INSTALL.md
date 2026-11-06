@@ -87,7 +87,7 @@ TG_CHAT_ID=
 - `WP2_BASE_URL`：必须为 HTTPS，填写 wp2 API 根地址（不包含 `/mod_mu/nodes`）。
 - `WP2_API_TOKEN`：wp2 通信密钥。某些 wp2 设置还会按来源 IP 控制访问，请在 wp2 服务端确认。
 - `PANEL_DOMAIN`：写实际域名，不要写带协议的 URL；需要域名解析到当前管理服务器。
-- 资源监控默认每分钟运行；面板创建的实例使用加密保存的 Root 密码 SSH 探测，其他实例可配置 SSH 密钥和已核实的主机密钥。`MONITOR_ENABLED=false` 可关闭监控。
+- 资源监控默认每分钟运行；页面可对选定实例立即 SSH 采样，显示 CPU、内存、磁盘、实时上下行 Mbps、默认路由网卡和累计收发字节。面板创建的实例使用加密保存的 Root 密码 SSH 探测，其他实例可配置 SSH 密钥和已核实的主机密钥。`MONITOR_ENABLED=false` 可关闭监控。
 
 生成强随机值的例子（输出只保存在你自己的终端，不要发到聊天、GitHub 或日志）：
 

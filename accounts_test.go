@@ -201,6 +201,40 @@ func TestMonitorShowsWhySSHProbeFailed(t *testing.T) {
 	}
 }
 
+func TestLinodeAccountBillingIsScopedAndRedacted(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "ci-admin")
+	store, err := initAccounts(filepath.Join(t.TempDir(), "accounts.enc"), strings.Repeat("b", 40))
+	if err != nil {
+		t.Fatal(err)
+	}
+	account, _ := store.add("credit-account", strings.Repeat("c", 40))
+	upstream := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v4/account" {
+			t.Errorf("unexpected Linode path: %s", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer "+strings.Repeat("c", 40) {
+			t.Error("billing used the wrong account token")
+		}
+		_, _ = w.Write([]byte(`{"balance":-2.5,"balance_uninvoiced":3.75,"email":"private@example.com","address_1":"private address","active_promotions":[{"summary":"$100 credit","credit_remaining":"80.00","this_month_credit_remaining":"15.00","credit_monthly_cap":"20.00","expire_dt":"2027-01-01T00:00:00","service_type":"all"}]}`))
+	}))
+	defer upstream.Close()
+	t.Setenv("LINODE_API_BASE_URL", upstream.URL+"/v4")
+	s := testServer(upstream.Client())
+	s.accounts = store
+	w := apiRequest(newHandler(s), http.MethodGet, "/api/accounts/"+account.ID+"/billing", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("billing HTTP %d: %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "private@example.com") || strings.Contains(w.Body.String(), "private address") {
+		t.Fatal("billing response leaked account contact data")
+	}
+	for _, value := range []string{"-2.5", "3.75", "$100 credit", "80.00", "15.00"} {
+		if !strings.Contains(w.Body.String(), value) {
+			t.Errorf("billing value %q missing from response %s", value, w.Body.String())
+		}
+	}
+}
+
 func TestAccountManagementHTTP(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "ci-admin")
 	t.Setenv("LINODE_TOKEN", "")

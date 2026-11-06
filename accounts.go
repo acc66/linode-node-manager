@@ -260,6 +260,50 @@ func (s *Server) accountsAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 405, "Method not allowed")
 	}
 }
+
+// accountBilling returns only the fields used by the dashboard. The upstream
+// /account response includes billing address and contact details, which must
+// never be forwarded to the browser.
+func (s *Server) accountBilling(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if id == "" {
+		fail(w, 400, "请先选择 Linode 账号")
+		return
+	}
+	body, status, err := s.linodeFor(r.Context(), id, http.MethodGet, "/account", nil)
+	if err != nil {
+		fail(w, 502, "Linode 账号查询失败")
+		return
+	}
+	if status != http.StatusOK {
+		if status == http.StatusForbidden {
+			fail(w, status, "Token 缺少账号只读权限（Account: Read Only / view_account）")
+			return
+		}
+		fail(w, status, fmt.Sprintf("Linode 账号查询失败（HTTP %d）", status))
+		return
+	}
+	var account struct {
+		Balance           float64 `json:"balance"`
+		BalanceUninvoiced float64 `json:"balance_uninvoiced"`
+		ActivePromotions  []struct {
+			Summary                string `json:"summary"`
+			CreditRemaining        string `json:"credit_remaining"`
+			MonthlyCreditRemaining string `json:"this_month_credit_remaining"`
+			CreditMonthlyCap       string `json:"credit_monthly_cap"`
+			ExpireAt               string `json:"expire_dt"`
+			ServiceType            string `json:"service_type"`
+		} `json:"active_promotions"`
+	}
+	if err := json.Unmarshal(body, &account); err != nil {
+		fail(w, 502, "Linode 账号账单数据格式无效")
+		return
+	}
+	send(w, 200, map[string]any{
+		"balance": account.Balance, "balance_uninvoiced": account.BalanceUninvoiced,
+		"active_promotions": account.ActivePromotions,
+	})
+}
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	if s.accounts == nil {
 		fail(w, 503, "Account storage unavailable")
@@ -345,11 +389,16 @@ func (s *Server) pollAccounts(ctx context.Context) {
 					cancel()
 					if probeErr == nil {
 						var metric struct {
-							CPU     float64 `json:"cpu"`
-							Memory  float64 `json:"memory"`
-							Disk    float64 `json:"disk"`
-							Uptime  float64 `json:"uptime"`
-							Service string  `json:"service"`
+							CPU              float64 `json:"cpu"`
+							Memory           float64 `json:"memory"`
+							Disk             float64 `json:"disk"`
+							Uptime           float64 `json:"uptime"`
+							Service          string  `json:"service"`
+							NetworkInterface string  `json:"network_interface"`
+							DownloadMbps     float64 `json:"download_mbps"`
+							UploadMbps       float64 `json:"upload_mbps"`
+							DownloadBytes    int64   `json:"download_bytes"`
+							UploadBytes      int64   `json:"upload_bytes"`
 						}
 						if json.Unmarshal([]byte(output), &metric) == nil && metric.CPU >= 0 && metric.CPU <= 100 && metric.Memory >= 0 && metric.Memory <= 100 && metric.Disk >= 0 && metric.Disk <= 100 && metric.Uptime >= 0 {
 							next.State = "online"
@@ -358,6 +407,11 @@ func (s *Server) pollAccounts(ctx context.Context) {
 							next.Disk = metric.Disk
 							next.Uptime = metric.Uptime
 							next.Service = metric.Service
+							next.NetworkInterface = metric.NetworkInterface
+							next.DownloadMbps = metric.DownloadMbps
+							next.UploadMbps = metric.UploadMbps
+							next.DownloadBytes = metric.DownloadBytes
+							next.UploadBytes = metric.UploadBytes
 						} else {
 							next.MonitorError = "SSH 探针返回无效监控数据"
 						}

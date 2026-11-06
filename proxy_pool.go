@@ -2,17 +2,20 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 )
 
 type poolProxy struct {
-	ID      string `json:"id"`
-	Name    string `json:"name"`
-	URL     string `json:"url,omitempty"`
-	Address string `json:"address,omitempty"`
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	URL           string   `json:"url,omitempty"`
+	Address       string   `json:"address,omitempty"`
+	BoundAccounts []string `json:"bound_accounts,omitempty"`
 }
 
 func (s *Server) proxyPool() []poolProxy {
@@ -43,13 +46,19 @@ func (s *Server) proxyPoolAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == "GET" {
 		entries := s.proxyPool()
+		s.credentials.mu.RLock()
+		owners := proxyOwnershipLocked(s.credentials)
 		for i := range entries {
+			endpoint, _ := proxyEndpointLocked(s.credentials, entries[i].URL)
+			entries[i].BoundAccounts = owners[endpoint]
+			sort.Strings(entries[i].BoundAccounts)
 			u, _ := validateProxyURL(entries[i].URL)
 			if u != nil {
 				entries[i].Address = u.Scheme + "://" + u.Host
 			}
 			entries[i].URL = ""
 		}
+		s.credentials.mu.RUnlock()
 		send(w, 200, map[string]any{"proxies": entries})
 		return
 	}
@@ -104,7 +113,7 @@ func (s *Server) proxyPoolAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if in.ID == "" {
-			if err := s.credentials.remove("linode-proxy-" + account + "/0"); err != nil {
+			if err := s.clearProxyConfig(account); err != nil {
 				fail(w, 500, "解除绑定失败")
 				return
 			}
@@ -116,6 +125,10 @@ func (s *Server) proxyPoolAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.saveProxyConfig(account, "pool:"+in.ID); err != nil {
+			if errors.Is(err, errProxyAlreadyBound) {
+				fail(w, 409, err.Error())
+				return
+			}
 			fail(w, 500, "绑定保存失败")
 			return
 		}

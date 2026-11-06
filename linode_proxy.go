@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -11,6 +12,104 @@ import (
 )
 
 type proxyContextKey struct{}
+
+var errProxyAlreadyBound = errors.New("该代理已绑定其他账号，请先解除原账号绑定")
+
+// Resolve pool references while the credential store lock is held. Compare
+// endpoints, so duplicate imports or different credentials cannot reuse one
+// proxy host and port across accounts.
+func resolveProxyLocked(store *accountStore, raw string) (string, error) {
+	if strings.HasPrefix(raw, "pool:") {
+		var entries []poolProxy
+		if json.Unmarshal([]byte(store.accounts["proxy-pool/0"].Token), &entries) != nil {
+			return "", errors.New("代理池配置无效")
+		}
+		id := strings.TrimPrefix(raw, "pool:")
+		raw = ""
+		for _, entry := range entries {
+			if entry.ID == id {
+				raw = entry.URL
+				break
+			}
+		}
+	}
+	return raw, nil
+}
+
+func proxyEndpointLocked(store *accountStore, raw string) (string, error) {
+	raw, err := resolveProxyLocked(store, raw)
+	if err != nil {
+		return "", err
+	}
+	u, err := validateProxyURL(raw)
+	if err != nil {
+		return "", err
+	}
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if ip := net.ParseIP(host); ip != nil {
+		host = ip.String()
+	}
+	port, _ := strconv.Atoi(u.Port())
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
+}
+
+func (s *Server) proxyForRequest(account string) (string, error) {
+	if account == "" {
+		account = "legacy"
+	}
+	if s.credentials == nil {
+		return "", errors.New("当前账号未配置代理")
+	}
+	store := s.credentials
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	record, ok := store.accounts["linode-proxy-"+account+"/0"]
+	if !ok {
+		return "", errors.New("当前账号未配置代理")
+	}
+	owners, err := proxyOwnersLocked(store, record.Token)
+	if err != nil {
+		return "", err
+	}
+	for _, owner := range owners {
+		if owner != account {
+			return "", errProxyAlreadyBound
+		}
+	}
+	return resolveProxyLocked(store, record.Token)
+}
+
+func proxyOwnershipLocked(store *accountStore) map[string][]string {
+	var entries []poolProxy
+	_ = json.Unmarshal([]byte(store.accounts["proxy-pool/0"].Token), &entries)
+	poolURLs := make(map[string]string, len(entries))
+	for _, entry := range entries {
+		poolURLs[entry.ID] = entry.URL
+	}
+	owners := map[string][]string{}
+	for key, record := range store.accounts {
+		if !strings.HasPrefix(key, "linode-proxy-") || strings.HasPrefix(key, "linode-proxy-enabled-") || !strings.HasSuffix(key, "/0") {
+			continue
+		}
+		raw := record.Token
+		if strings.HasPrefix(raw, "pool:") {
+			raw = poolURLs[strings.TrimPrefix(raw, "pool:")]
+		}
+		endpoint, err := proxyEndpointLocked(store, raw)
+		if err == nil {
+			owners[endpoint] = append(owners[endpoint], strings.TrimSuffix(strings.TrimPrefix(key, "linode-proxy-"), "/0"))
+		}
+	}
+	return owners
+}
+
+func proxyOwnersLocked(store *accountStore, raw string) ([]string, error) {
+	endpoint, err := proxyEndpointLocked(store, raw)
+	if err != nil {
+		return nil, err
+	}
+	return proxyOwnershipLocked(store)[endpoint], nil
+}
 
 func validateProxyURL(raw string) (*url.URL, error) {
 	u, err := url.Parse(strings.TrimSpace(raw))
@@ -99,6 +198,17 @@ func (s *Server) linodeProxyAPI(w http.ResponseWriter, r *http.Request) {
 					fail(w, 400, "请先保存当前账号的代理")
 					return
 				}
+				raw, _ := s.credentials.token("linode-proxy-" + account + "/0")
+				if err := s.saveProxyConfig(account, raw); err != nil {
+					if errors.Is(err, errProxyAlreadyBound) {
+						fail(w, 409, err.Error())
+					} else {
+						fail(w, 500, "代理启用状态保存失败")
+					}
+					return
+				}
+				send(w, 200, map[string]bool{"saved": true})
+				return
 			}
 			if err := s.saveRootPassword("linode-proxy-enabled-"+account, 0, "Proxy enabled", strconv.FormatBool(*in.Enabled)); err != nil {
 				fail(w, 500, "代理启用状态保存失败")
@@ -113,17 +223,19 @@ func (s *Server) linodeProxyAPI(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := s.saveProxyConfig(account, u.String()); err != nil {
+			if errors.Is(err, errProxyAlreadyBound) {
+				fail(w, 409, err.Error())
+				return
+			}
 			fail(w, 500, "代理保存失败，原配置保留")
 			return
 		}
 		send(w, 200, map[string]bool{"configured": true})
 		return
 	case "DELETE":
-		if _, ok := s.proxyURL(account); ok {
-			if err := s.credentials.remove("linode-proxy-" + account + "/0"); err != nil {
-				fail(w, 500, "无法删除代理")
-				return
-			}
+		if err := s.clearProxyConfig(account); err != nil {
+			fail(w, 500, "无法删除代理")
+			return
 		}
 		send(w, 200, map[string]bool{"configured": false})
 		return
@@ -169,6 +281,15 @@ func (s *Server) saveProxyConfig(account, raw string) error {
 	store := s.credentials
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	owners, err := proxyOwnersLocked(store, raw)
+	if err != nil {
+		return err
+	}
+	for _, owner := range owners {
+		if owner != account {
+			return errProxyAlreadyBound
+		}
+	}
 	key := "linode-proxy-" + account + "/0"
 	enabledKey := "linode-proxy-enabled-" + account + "/0"
 	previous, exists := store.accounts[key]
@@ -185,6 +306,33 @@ func (s *Server) saveProxyConfig(account, raw string) error {
 			store.accounts[enabledKey] = previousEnabled
 		} else {
 			delete(store.accounts, enabledKey)
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *Server) clearProxyConfig(account string) error {
+	if s.credentials == nil {
+		return nil
+	}
+	store := s.credentials
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	key, enabledKey := "linode-proxy-"+account+"/0", "linode-proxy-enabled-"+account+"/0"
+	previous, exists := store.accounts[key]
+	previousEnabled, enabledExists := store.accounts[enabledKey]
+	if !exists && !enabledExists {
+		return nil
+	}
+	delete(store.accounts, key)
+	delete(store.accounts, enabledKey)
+	if err := store.saveLocked(); err != nil {
+		if exists {
+			store.accounts[key] = previous
+		}
+		if enabledExists {
+			store.accounts[enabledKey] = previousEnabled
 		}
 		return err
 	}

@@ -12,7 +12,7 @@ else if(key==='/telegram/settings'&&options.method==='POST')data={saved:true};
 else if(key==='/telegram/test')data={message:'测试消息已发送'};
 else if(key==='/dns/providers'&&options.method==='POST')data={saved:true};
 else if(key==='/wp2/session'){if(options.method==='POST')connected=true;if(options.method==='DELETE')connected=false;data={connected}}
-else if(key==='/proxy-pool'){if(options.method==='PUT'){const account=new URLSearchParams(path.split('?')[1]).get('account_id');proxyBindings[account]=JSON.parse(options.body).id;data={saved:true}}else data={proxies:poolProxies}}
+else if(key==='/proxy-pool'){if(options.method==='PUT'){const account=new URLSearchParams(path.split('?')[1]).get('account_id');proxyBindings[account]=JSON.parse(options.body).id;data={saved:true}}else data={proxies:poolProxies.map(p=>({...p,bound_accounts:Object.entries(proxyBindings).filter(([account,id])=>id===p.id).map(([account])=>account)}))}}
 else if(key==='/linode/proxy'){const account=new URLSearchParams(path.split('?')[1]).get('account_id');const id=proxyBindings[account]||'';data={configured:Boolean(id),pool_id:id,address:poolProxies.find(p=>p.id===id)?.address||'',enabled:Boolean(id)}}
 else if(key==='/accounts'&&options.method==='POST'){const body=JSON.parse(options.body);data={id:'new-account',name:body.name};responses['/accounts'].accounts.push(data);proxyBindings[data.id]=body.proxy_id}
 else if(key==='/accounts/second/billing'||key==='/accounts/new-account/billing')data=responses['/accounts/legacy/billing'];
@@ -33,8 +33,8 @@ get('wp2email').value='admin@example.com';get('wp2password').value='mock-login-p
 get('tgtoken').value='123456:mock-test-token-123456789012345';get('tgchat').value='-100123456';get('tgenabled').checked=true;await context.saveTelegram();assert.equal(get('tgtoken').value,'');await context.testTelegram();assert.equal(get('tgtest').disabled,false);
 get('dnsprovider').value='cloudflare';get('dnszone').value='example.com';get('dnstoken').value='mock-cf-key';get('dnsenabled').checked=true;await context.discoverDNS();assert.equal(get('dnszone').value,'example.com');await context.saveDNS();assert.equal(get('dnstoken').value,'');
 responses['/accounts'].accounts.push({id:'second',name:'第二账号'});
-await context.openProxyPool();assert.equal(get('poolaccount').options.length,3);assert.equal(get('accountproxy').options.length,3);assert.equal(get('poolproxy').value,'p1');
-get('poolaccount').value='second';await context.poolAccountChanged();get('poolproxy').value='p2';
+await context.openProxyPool();assert.equal(get('poolaccount').options.length,3);assert.equal(get('accountproxy').options.length,3);assert.equal(get('poolproxy').value,'p1');assert.equal(get('accountproxy').options.find(o=>o.value==='p1').disabled,true);assert.equal(get('poolproxy').options.find(o=>o.value==='p1').disabled,false);
+get('poolaccount').value='second';await context.poolAccountChanged();assert.equal(get('poolproxy').options.find(o=>o.value==='p1').disabled,true);get('poolproxy').value='p2';
 const beforeUnboundTest=calls.filter(c=>c.path.includes('/billing')).length;await context.testPoolBalance();assert.equal(calls.filter(c=>c.path.includes('/billing')).length,beforeUnboundTest);assert(get('poolmsg').textContent.includes('请先绑定'));
 await context.bindPoolProxy();assert.equal(proxyBindings.second,'p2');assert.equal(proxyBindings.legacy,'p1');assert.equal(get('account').value,'legacy');
 const firstBalance=context.testPoolBalance();await context.testPoolBalance();await firstBalance;assert.equal(calls.filter(c=>c.path==='/api/accounts/second/billing?account_id=second&use_proxy=true').length,1);assert.equal(get('poolbilling').options.length,3);assert(get('poolmsg').textContent.includes('第二账号'));

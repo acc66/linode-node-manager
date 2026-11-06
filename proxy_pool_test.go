@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -82,6 +85,7 @@ func TestProxyPoolAccountCreationBindingAndUnbinding(t *testing.T) {
 		return a
 	}
 	first := create("first", entries[0].ID, 201)
+	create("duplicate", entries[0].ID, 409)
 	second := create("second", "", 201)
 	create("invalid", "missing-proxy", 400)
 	if len(s.accounts.list()) != 2 {
@@ -102,6 +106,7 @@ func TestProxyPoolAccountCreationBindingAndUnbinding(t *testing.T) {
 		}
 	}
 	bind(second.ID, entries[1].ID, 200)
+	bind(second.ID, entries[0].ID, 409)
 	bind(first.ID, "missing-proxy", 400)
 	bind("missing-account", entries[1].ID, 400)
 	w := apiRequest(h, "GET", "/api/linode/proxy?account_id="+second.ID, "")
@@ -118,8 +123,117 @@ func TestProxyPoolAccountCreationBindingAndUnbinding(t *testing.T) {
 	if raw, _ := s.proxyURL(first.ID); raw != entries[0].URL {
 		t.Fatal("binding another account changed the first account")
 	}
+	if err := s.clearProxyConfig(first.ID); err != nil {
+		t.Fatal(err)
+	}
+	bind(second.ID, entries[0].ID, 200)
+	bind(second.ID, entries[0].ID, 200)
+	if w := apiRequest(h, "DELETE", "/api/accounts/"+second.ID, ""); w.Code != 200 {
+		t.Fatal("account deletion failed:", w.Body.String())
+	}
+	create("reuses-deleted-account-proxy", entries[0].ID, 201)
 	if w := apiRequest(h, "PATCH", "/api/proxy-pool", `{"id":"`+entries[0].ID+`"}`); w.Code != 405 {
 		t.Fatal("removed external IP test endpoint remains available")
+	}
+}
+
+func TestExclusiveProxyBindingConcurrentAndDuplicateEntries(t *testing.T) {
+	s := testServer(http.DefaultClient)
+	dnsTestStore(t, s)
+	entries, _ := json.Marshal([]poolProxy{
+		{ID: "one", URL: "http://user:secret@PROXY.example:8080"},
+		{ID: "duplicate", URL: "socks5://other:password@proxy.example.:08080"},
+	})
+	if err := s.saveRootPassword("proxy-pool", 0, "pool", string(entries)); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	results := make(chan error, 24)
+	start := make(chan struct{})
+	for i := 0; i < 24; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			proxy := "pool:one"
+			if i%2 == 1 {
+				proxy = "pool:duplicate"
+			}
+			results <- s.saveProxyConfig(fmt.Sprintf("account-%d", i), proxy)
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	winners := 0
+	for err := range results {
+		if err == nil {
+			winners++
+		} else if !errors.Is(err, errProxyAlreadyBound) {
+			t.Fatal(err)
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("same proxy endpoint bound to %d accounts", winners)
+	}
+	s.credentials.mu.RLock()
+	owners, err := proxyOwnersLocked(s.credentials, "http://proxy.example:8080")
+	s.credentials.mu.RUnlock()
+	if err != nil || len(owners) != 1 {
+		t.Fatalf("unexpected owners: %v, %v", owners, err)
+	}
+	owner := owners[0]
+	if err := s.saveProxyConfig(owner, "http://proxy.example:8080"); err != nil {
+		t.Fatal("same account must be able to update its own binding:", err)
+	}
+	if err := s.saveRootPassword("linode-proxy-enabled-"+owner, 0, "disabled", "false"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.saveProxyConfig("another", "pool:duplicate"); !errors.Is(err, errProxyAlreadyBound) {
+		t.Fatal("disabled proxy did not retain its reservation:", err)
+	}
+	w := httptest.NewRecorder()
+	s.proxyPoolAPI(w, httptest.NewRequest("GET", "/api/proxy-pool", nil))
+	var response struct {
+		Proxies []poolProxy `json:"proxies"`
+	}
+	if json.Unmarshal(w.Body.Bytes(), &response) != nil || len(response.Proxies) != 2 {
+		t.Fatal("invalid pool response")
+	}
+	for _, entry := range response.Proxies {
+		if len(entry.BoundAccounts) != 1 || entry.BoundAccounts[0] != owner || entry.URL != "" {
+			t.Fatal("duplicate pool entries did not share safe occupancy metadata")
+		}
+	}
+	if err := s.clearProxyConfig(owner); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.clearProxyConfig(owner); err != nil {
+		t.Fatal("unbinding should be idempotent:", err)
+	}
+	if err := s.saveProxyConfig("another", "pool:duplicate"); err != nil {
+		t.Fatal("released proxy could not be reassigned:", err)
+	}
+}
+
+func TestLegacySharedProxyBindingsCannotSendRequests(t *testing.T) {
+	s := testServer(nil)
+	dnsTestStore(t, s)
+	for _, account := range []string{"first", "second"} {
+		if err := s.saveRootPassword("linode-proxy-"+account, 0, "old binding", "http://proxy.example:8080"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, account := range []string{"first", "second"} {
+		if _, err := s.proxyForRequest(account); !errors.Is(err, errProxyAlreadyBound) {
+			t.Fatal("legacy shared proxy was permitted:", err)
+		}
+	}
+	if err := s.clearProxyConfig("second"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.proxyForRequest("first"); err != nil {
+		t.Fatal("unbinding second account did not resolve the conflict:", err)
 	}
 }
 

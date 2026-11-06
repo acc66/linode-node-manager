@@ -45,4 +45,10 @@ func TestProxySavePersistsEnabledTogether(t *testing.T) {
 	if raw != "http://user:secret@proxy.example:8080" {
 		t.Fatal("failed save changed original configuration")
 	}
+	if err := s.clearProxyConfig("account-a"); err == nil {
+		t.Fatal("expected unbinding storage failure")
+	}
+	if err := s.saveProxyConfig("account-b", raw); !errors.Is(err, errProxyAlreadyBound) {
+		t.Fatal("failed unbind released the proxy reservation:", err)
+	}
 }

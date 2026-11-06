@@ -211,9 +211,9 @@ func (s *Server) linodeFor(ctx context.Context, accountID, method, path string, 
 	}
 	base := env("LINODE_API_BASE_URL", "https://api.linode.com/v4")
 	if enabled, _ := ctx.Value(proxyContextKey{}).(bool); enabled {
-		proxy, ok := s.proxyURL(accountID)
-		if !ok {
-			return nil, 503, errors.New("当前账号未配置代理")
+		proxy, err := s.proxyForRequest(accountID)
+		if err != nil {
+			return nil, 503, err
 		}
 		client, err := proxyClient(s.client, proxy)
 		if err != nil {
@@ -280,6 +280,10 @@ func (s *Server) accountsAPI(w http.ResponseWriter, r *http.Request) {
 			if err := s.saveProxyConfig(a.ID, in.ProxyURL); err != nil {
 				if rollbackErr := s.accounts.remove(a.ID); rollbackErr != nil {
 					fail(w, 500, "账号已创建但代理保存失败，请刷新账号列表，勿重复添加")
+					return
+				}
+				if errors.Is(err, errProxyAlreadyBound) {
+					fail(w, 409, err.Error()+"；账号未创建")
 					return
 				}
 				fail(w, 500, "代理保存失败，账号创建已撤销")
@@ -370,6 +374,10 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 			fail(w, 500, "无法保存默认账号移除状态")
 			return
 		}
+		if err := s.clearProxyConfig(id); err != nil {
+			fail(w, 500, "默认账号已移除，但代理解绑失败，请核对凭据存储")
+			return
+		}
 		send(w, 200, map[string]bool{"deleted": true})
 		return
 	}
@@ -380,6 +388,10 @@ func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		fail(w, 500, "Failed to save account changes")
+		return
+	}
+	if err := s.clearProxyConfig(id); err != nil {
+		fail(w, 500, "账号已移除，但代理解绑失败，请核对凭据存储")
 		return
 	}
 	// Do not modify or shut down any Linode instance when an account is removed.

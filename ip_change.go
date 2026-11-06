@@ -73,8 +73,8 @@ func (s *Server) ipInstance(ctx context.Context, account string, id int) (Instan
 	return i, err
 }
 func (s *Server) checkIPTarget(ctx context.Context, account string, i Instance) error {
-	if i.Status != "running" && i.Status != "offline" {
-		return errors.New("实例必须处于运行或关机状态")
+	if i.Status != "running" {
+		return errors.New("请先启动实例，换 IP 需要验证新地址的 TCP 连通性")
 	}
 	if i.Region == "" || publicIP(i) == "" || len(i.IPv4) != 1 {
 		return errors.New("当前换 IP 仅支持单公网 IPv4、无附加私网 IPv4 的实例")
@@ -346,7 +346,7 @@ func (s *Server) runIPChangeUsingHelper(ctx context.Context, op *IPChange) (runE
 	}
 	if op.Job.TargetID > 0 {
 		s.ipJobLog(op, "更新绑定 wp2 节点的 DNS…")
-		ready, log, err := s.prepareDeploymentDNS(ctx, env("WP2_BASE_URL", ""), env("WP2_API_TOKEN", ""), op.Job.TargetID, &original)
+		ready, log, err := s.syncBoundDDNS(ctx, account, op.Job.TargetID, &original)
 		s.ipJobLog(op, log)
 		if err != nil {
 			op.Job.DNSStatus = "failed"
@@ -656,4 +656,34 @@ func (s *Server) ipChangeListAPI(w http.ResponseWriter, r *http.Request) {
 		jobs = jobs[:20]
 	}
 	send(w, 200, map[string]any{"jobs": jobs})
+}
+
+// syncBoundDDNS updates every node installed on this server, including multi-node installs.
+func (s *Server) syncBoundDDNS(ctx context.Context, account string, target int, instance *Instance) (bool, string, error) {
+	targets := []int{target}
+	if s.credentials != nil {
+		if raw, ok := s.credentials.token("ddns-bindings-" + account + "/" + strconv.Itoa(instance.ID)); ok {
+			var saved []int
+			if err := json.Unmarshal([]byte(raw), &saved); err != nil {
+				return false, "", errors.New("DDNS 绑定损坏，请重新安装后端保存绑定")
+			}
+			if len(saved) > 0 {
+				targets = saved
+			}
+		}
+	}
+	ready := false
+	log := ""
+	for _, node := range targets {
+		updated, output, err := s.prepareDeploymentDNS(ctx, env("WP2_BASE_URL", ""), env("WP2_API_TOKEN", ""), node, instance)
+		log += fmt.Sprintf("DDNS 节点 #%d：\n", node) + output
+		if err != nil {
+			return ready, log, err
+		}
+		if !updated {
+			return ready, log, fmt.Errorf("节点 #%d 的 DDNS 未更新，请检查域名配置", node)
+		}
+		ready = true
+	}
+	return ready, log, nil
 }

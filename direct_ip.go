@@ -330,7 +330,7 @@ func (s *Server) runDirectIPChange(ctx context.Context, op *IPChange) (runErr er
 		}
 	}
 	if op.Job.TargetID > 0 {
-		ready, log, dnsErr := s.prepareDeploymentDNS(ctx, env("WP2_BASE_URL", ""), env("WP2_API_TOKEN", ""), op.Job.TargetID, &original)
+		ready, log, dnsErr := s.syncBoundDDNS(ctx, account, op.Job.TargetID, &original)
 		s.ipJobLog(op, log)
 		if dnsErr != nil {
 			op.Job.DNSStatus = "failed"

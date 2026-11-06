@@ -154,6 +154,12 @@ func TestMockInstallTaskAndRedaction(t *testing.T) {
 	defer upstream.Close()
 	t.Setenv("LINODE_API_BASE_URL", upstream.URL+"/v4")
 	s := testServer(upstream.Client())
+	store, storeErr := initAccounts(t.TempDir()+"/credentials.enc", strings.Repeat("k", 40))
+	if storeErr != nil {
+		t.Fatal(storeErr)
+	}
+	s.credentials = store
+
 	scripted := make(chan string, 1)
 	s.sshRun = func(_ context.Context, ip, script string) (string, error) {
 		if ip != "8.8.8.8" {
@@ -168,6 +174,9 @@ func TestMockInstallTaskAndRedaction(t *testing.T) {
 		if w.Code != 400 {
 			t.Fatalf("invalid install should be 400, got %d", w.Code)
 		}
+	}
+	if w := apiRequest(h, "POST", "/api/deployments/install", `{"instance_id":33,"mode":"node","operation":"unknown","target_id":19}`); w.Code != 400 {
+		t.Fatalf("invalid operation should be 400, got %d", w.Code)
 	}
 	w := apiRequest(h, "POST", "/api/deployments/install", `{"instance_id":33,"mode":"node","target_id":19}`)
 	if w.Code != 202 {
@@ -201,6 +210,9 @@ func TestMockInstallTaskAndRedaction(t *testing.T) {
 			t.Fatal(err)
 		}
 		if job.Status == "success" {
+			if raw, ok := s.credentials.token("ddns-bindings-legacy/33"); !ok || raw != "[19]" {
+				t.Fatalf("DDNS binding not saved: %q", raw)
+			}
 			if strings.Contains(job.Log, "mock-install-secret") || !strings.Contains(job.Log, "[REDACTED]") {
 				t.Fatalf("job log contains credential: %q", job.Log)
 			}

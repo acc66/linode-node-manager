@@ -64,3 +64,20 @@ func TestBootInitializationOnlyAddsUFWRulesWhenEnabled(t *testing.T) {
 		t.Fatal("boot UFW setup must be idempotent and allow outbound traffic")
 	}
 }
+
+func TestBootTuningDisabledForBothEntryPoints(t *testing.T) {
+	s := testServer(nil)
+	dnsTestStore(t, s)
+	if err := s.saveRootPassword("legacy", 7, "node", "root-password"); err != nil {
+		t.Fatal(err)
+	}
+	if id := s.queueBootTuning("legacy", 7, false); id != "" {
+		t.Fatal("power action queued disabled tuning")
+	}
+	if id := s.queueBootTuningWithCheck("legacy", 7, false, true); id != "" {
+		t.Fatal("creation queued disabled tuning")
+	}
+	if len(s.jobs) != 0 {
+		t.Fatal("disabled tuning registered background jobs")
+	}
+}

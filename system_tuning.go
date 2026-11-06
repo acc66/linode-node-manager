@@ -91,15 +91,26 @@ func (s *Server) tuneNode(ctx context.Context, account string, instance Instance
 	return output, err
 }
 func (s *Server) queueBootTuning(account string, id int, useProxy bool) string {
-	if s.skipBootTuning {
-		return ""
-	}
 	if account == "" {
 		account = "legacy"
+	}
+	return s.queueBootTuningWithCheck(account, id, useProxy, false)
+}
+
+func (s *Server) queueBootTuningWithCheck(account string, id int, useProxy, aliyunCheck bool) string {
+	if s.skipBootTuning {
+		return ""
 	}
 	canTune := s.canTune(account, id)
 	bootSettings, settingsErr := s.chinaBootSettings()
 	provider, providerErr := s.chinaProbeProvider()
+	if aliyunCheck {
+		bootSettings.Enabled = true
+		bootSettings.Port = 22
+		bootSettings.AutoReplace = false
+		provider = "aliyun"
+		providerErr = nil
+	}
 	checkChina := settingsErr == nil && providerErr == nil && bootSettings.Enabled && s.chinaProbeConfigured(provider)
 	if !canTune && !checkChina {
 		return ""
@@ -110,11 +121,10 @@ func (s *Server) queueBootTuning(account string, id int, useProxy bool) string {
 		job.Log += "等待实例运行，配置 BBR 与 nofile…\n"
 	}
 	if checkChina {
-		job.Log += fmt.Sprintf("开机后将从所选国内探测方式检查 TCP/%d。\n", bootSettings.Port)
+		job.Log += fmt.Sprintf("开机后将使用 %s 检查 TCP/%d。\n", provider, bootSettings.Port)
 	} else if settingsErr != nil {
 		job.Log += "开机 IP 检测设置无效：" + settingsErr.Error() + "\n"
 	} else if bootSettings.Enabled && (providerErr != nil || !s.chinaProbeConfigured(provider)) {
-		job.Status = "partial"
 		job.Log += "开机 IP 检测已启用，但所选国内探测方式未配置；本次只执行可用的开机优化。\n"
 	}
 	s.mu.Lock()
@@ -128,7 +138,7 @@ func (s *Server) queueBootTuning(account string, id int, useProxy bool) string {
 			job.Status = "failed"
 			job.Log += "开机等待实例运行失败：" + err.Error() + "\n"
 		} else if job.Status == "queued" {
-			job.Status = "success"
+			job.Status = "running"
 		}
 		if err == nil && checkChina {
 			job.Log += fmt.Sprintf("等待实例 TCP/%d 开始监听，未监听时不会误判为 IP 被墙。\n", bootSettings.Port)
@@ -139,6 +149,8 @@ func (s *Server) queueBootTuning(account string, id int, useProxy bool) string {
 				job.Log += "开机 IP 检测跳过：" + portErr.Error() + "\n"
 			} else {
 				instance = probeInstance
+				job.Log += fmt.Sprintf("开始 %s 探测 %s TCP/%d…\n", provider, publicIP(instance), bootSettings.Port)
+				s.publishBootJob(job)
 				output, probeErr := s.checkChinaTCP(ctx, provider, publicIP(instance), bootSettings.Port)
 				if probeErr == nil {
 					job.Log += "国内 IP/TCP 检测通过：" + output + "\n"
@@ -150,7 +162,10 @@ func (s *Server) queueBootTuning(account string, id int, useProxy bool) string {
 					} else {
 						job.Log += "开始自动申请并验证候选 IP；候选地址不通过国内 TCP 检查时会保留旧 IP。\n"
 						s.publishBootJob(job)
-						instance, op, replaceErr := s.replaceIPFromBoot(ctx, account, instance, bootSettings.Port, provider, useProxy)
+						replacement, op, replaceErr := s.replaceIPFromBoot(ctx, account, instance, bootSettings.Port, provider, useProxy)
+						if replacement.ID == instance.ID && publicIP(replacement) != "" {
+							instance = replacement
+						}
 						if replaceErr != nil {
 							job.Status = "failed"
 							if op != nil && op.Job.IPChanged {
@@ -178,9 +193,17 @@ func (s *Server) queueBootTuning(account string, id int, useProxy bool) string {
 			output, tuneErr := s.tuneNode(ctx, account, instance, s.openPortsSaved(account, id))
 			job.Log += output
 			if tuneErr != nil {
-				job.Status = "partial"
+				if job.Status != "failed" {
+					job.Status = "partial"
+				}
 				job.Log += "\n开机优化失败，请核对 SSH：" + tuneErr.Error() + "\n"
-			} else if strings.Contains(output, "BBR_UNSUPPORTED") && job.Status == "success" {
+			} else if strings.Contains(output, "BBR_UNSUPPORTED") && job.Status == "running" {
+				job.Status = "partial"
+			}
+		}
+		if job.Status == "running" {
+			job.Status = "success"
+			if bootSettings.Enabled && !checkChina {
 				job.Status = "partial"
 			}
 		}

@@ -2,7 +2,7 @@
 
 **完整中文安装手册：** [INSTALL.md](INSTALL.md)（Debian 12、GitHub 编译包、账号密码、HTTPS、监控、Telegram、排错）。
 
-独立的 Go 1.22+ Linode 运维面板。主程序：`main.go`，不再使用 Python FastAPI。当前版本为 Go MVP，未完成真实 Linode/SSH/TG 联调。
+独立的 Go 1.22+ Linode 运维面板。主程序：`main.go`，不再使用 Python FastAPI。当前版本为 Go MVP，尚未完成全部真实 Linode/SSH/TG 联调。
 
 ## VLESS 非法路径拉黑检查
 
@@ -25,7 +25,7 @@ curl -i --max-time 5 http://服务器IPv4:端口/错误路径
 只有安装了防护代码之后新装或重装的 VLESS 节点才会带有该配置。检查不到 `guard.enabled` 时，在面板重装对应 VLESS 节点；如果日志有 `guard: enabled` 但没有 `probe/banned`，则尚未有请求命中错误路径。
 
 ## 已实现
-- Linode 多账号管理及账号移除；创建、开机、关机、重启、删除实例；显示 IP、地区和套餐；Root 密码加密保存
+- Linode 多账号管理及账号移除；创建、开机、关机、重启、删除实例；显示 IP、地区和套餐；Root 密码加密保存，现有实例可手动导入 SSH 密码
 - wp2 管理员登录同步全部节点（支持动态码），会话加密保存；兼容 muKey 节点列表接口
 - HTTP/HTTPS/SOCKS5 代理按账号加密保存，创建和开关机等操作可选择代理或直连，失败不自动回退
 - 搜索并多选 wp2 节点后批量安装：保留同机其他节点配置，Hysteria2 UDP 端口跳跃、纯 WS VLESS 防探测按配置启用；发行文件校验、证书续期与失败恢复
@@ -33,7 +33,7 @@ curl -i --max-time 5 http://服务器IPv4:端口/错误路径
 - 手机适配界面：服务器卡片、底部导航、折叠配置；wp2 节点默认折叠、搜索、每页 10 条显示
 - SSH 获取 CPU、内存、磁盘、服务状态、实时上下行速率和系统网卡累计流量；页面可立即采样
 - Telegram 网页设置 Bot Token/Chat ID、提醒开关、测试消息；离线、恢复、资源异常及服务异常通知
-- 同区域临时无盘实例辅助更换原实例公网 IPv4，保留原实例磁盘；确认 swap 后回收临时实例并更新 DNS
+- 在原实例申请额外公网 IPv4，验证新地址后释放旧地址并更新 DNS；保留原实例磁盘，不创建临时实例
 - 默认每分钟监控 CPU、内存、磁盘、网卡速率和服务状态；优先用面板加密保存的实例 Root 密码，最多并发探测 6 台
 - 浏览器使用 HTTP Basic 账号密码登录（必须通过 HTTPS 公网访问），自动化 API 仍支持 `Authorization: Bearer ADMIN_TOKEN`
 

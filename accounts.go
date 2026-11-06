@@ -223,7 +223,7 @@ func (s *Server) linodeFor(ctx context.Context, accountID, method, path string, 
 		temporary := &Server{client: client}
 		b, status, err := temporary.request(ctx, method, strings.TrimRight(base, "/")+path, token, payload)
 		if err != nil {
-			return nil, 502, errors.New("Linode 代理请求失败；未切换直连")
+			return nil, 502, fmt.Errorf("Linode 代理请求失败：%s；未切换直连", safeProxyFailure(err))
 		}
 		return b, status, nil
 	}
@@ -243,17 +243,48 @@ func (s *Server) accountsAPI(w http.ResponseWriter, r *http.Request) {
 		send(w, 200, map[string]any{"accounts": out})
 	case http.MethodPost:
 		var in struct {
-			Name  string `json:"name"`
-			Token string `json:"token"`
+			Name     string `json:"name"`
+			Token    string `json:"token"`
+			ProxyURL string `json:"proxy_url"`
+			ProxyID  string `json:"proxy_id"`
 		}
 		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 16<<10)).Decode(&in); err != nil {
 			fail(w, 400, "Invalid account payload")
 			return
 		}
+		if strings.TrimSpace(in.ProxyURL) != "" {
+			parsed, err := validateProxyURL(in.ProxyURL)
+			if err != nil {
+				fail(w, 400, err.Error())
+				return
+			}
+			if s.credentials == nil {
+				fail(w, 503, "代理加密存储未配置，账号未创建")
+				return
+			}
+			in.ProxyURL = parsed.String()
+		}
+		if in.ProxyID != "" {
+			if _, ok := s.poolURL(in.ProxyID); !ok {
+				fail(w, 400, "所选代理不存在，账号未创建")
+				return
+			}
+			in.ProxyURL = "pool:" + in.ProxyID
+		}
 		a, err := s.accounts.add(in.Name, in.Token)
 		if err != nil {
 			fail(w, 400, err.Error())
 			return
+		}
+		if in.ProxyURL != "" {
+			if err := s.saveProxyConfig(a.ID, in.ProxyURL); err != nil {
+				if rollbackErr := s.accounts.remove(a.ID); rollbackErr != nil {
+					fail(w, 500, "账号已创建但代理保存失败，请刷新账号列表，勿重复添加")
+					return
+				}
+				fail(w, 500, "代理保存失败，账号创建已撤销")
+				return
+			}
 		}
 		send(w, 201, a)
 	default:
@@ -272,10 +303,18 @@ func (s *Server) accountBilling(w http.ResponseWriter, r *http.Request) {
 	}
 	body, status, err := s.linodeFor(r.Context(), id, http.MethodGet, "/account", nil)
 	if err != nil {
-		fail(w, 502, "Linode 账号查询失败")
+		message := "Linode 直连查询失败：" + safeProxyFailure(err)
+		if enabled, _ := r.Context().Value(proxyContextKey{}).(bool); enabled {
+			message = err.Error()
+		}
+		fail(w, 502, message)
 		return
 	}
 	if status != http.StatusOK {
+		if status == http.StatusUnauthorized {
+			fail(w, status, "Linode Token 无效或已过期，请更新当前账号的 Token")
+			return
+		}
 		if status == http.StatusForbidden {
 			fail(w, status, "Token 缺少账号只读权限（Account: Read Only / view_account）")
 			return

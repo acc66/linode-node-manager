@@ -221,15 +221,27 @@ func (s *Server) checkDomesticTCP(ctx context.Context, targetIP string, port int
 		return "", errors.New("待测 IP 或 TCP 端口无效")
 	}
 	// IP and port are strictly validated above, so they cannot inject shell syntax.
-	script := fmt.Sprintf("if timeout 7 bash -c 'true >/dev/tcp/%s/%d' >/dev/null 2>&1; then echo DOMESTIC_TCP_OPEN; else echo DOMESTIC_TCP_CLOSED; fi\n", ip.To4().String(), port)
+	script := fmt.Sprintf("command -v timeout >/dev/null 2>&1 || { echo DOMESTIC_TCP_UNKNOWN; exit 1; }\nif timeout 7 bash -c 'true >/dev/tcp/%s/%d' >/dev/null 2>&1; then echo DOMESTIC_TCP_OPEN; else echo DOMESTIC_TCP_CLOSED; fi\n", ip.To4().String(), port)
 	output, err := s.domesticProbeSSH(ctx, config, script)
 	if err != nil {
 		return output, err
 	}
-	if strings.Contains(output, "DOMESTIC_TCP_OPEN") {
+	open, closed := false, false
+	for _, line := range strings.Split(output, "\n") {
+		switch strings.TrimSpace(line) {
+		case "DOMESTIC_TCP_OPEN":
+			open = true
+		case "DOMESTIC_TCP_CLOSED":
+			closed = true
+		}
+	}
+	if open && !closed {
 		return output, nil
 	}
-	return output, fmt.Errorf("%w：阿里云探测机无法连接 %s:%d", errDomesticTCPUnreachable, ip.To4().String(), port)
+	if closed && !open {
+		return output, fmt.Errorf("%w：阿里云探测机无法连接 %s:%d", errDomesticTCPUnreachable, ip.To4().String(), port)
+	}
+	return output, errors.New("国内探测未返回唯一有效的 TCP 检测结果，保留当前 IP")
 }
 
 func (s *Server) checkChinaTCP(ctx context.Context, provider, targetIP string, port int) (string, error) {

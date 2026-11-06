@@ -172,6 +172,9 @@ class DeployTests(unittest.TestCase):
             self.assertFalse(any(args[:3] == ('systemctl', 'disable', '--now') and args[-1] == 'xboard-node-port-hops.service' for args in commands))
             installed = json.loads((Path(tmp) / 'config' / 'config.yml').read_text())
             self.assertEqual({x['panel']['node_id'] for x in installed['instances']}, {929, 930})
+            config_dirs = {x['kernel']['config_dir'] for x in installed['instances']}
+            self.assertEqual(len(config_dirs), 2)
+            self.assertNotIn('/etc/XboardNode-Plus', config_dirs)
 
 
 if __name__ == '__main__':

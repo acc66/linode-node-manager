@@ -335,7 +335,7 @@ func (s *Server) runIPChange(ctx context.Context, op *IPChange) (runErr error) {
 	}
 	if wasRunning && s.canTune(account, source.ID) {
 		s.ipJobLog(op, "通过新 IP 验证 SSH，并应用持久 BBR/nofile 设置…")
-		output, tuneErr := s.tuneNode(ctx, account, original)
+		output, tuneErr := s.tuneNode(ctx, account, original, s.openPortsSaved(account, source.ID))
 		s.ipJobLog(op, output)
 		if tuneErr != nil {
 			s.ipJobLog(op, "新 IP 的 SSH/优化暂未验证成功："+tuneErr.Error())

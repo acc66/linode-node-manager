@@ -76,7 +76,13 @@ func (s *Server) linodeProxyAPI(w http.ResponseWriter, r *http.Request) {
 				address = u.Scheme + "://" + u.Host
 			}
 		}
-		send(w, 200, map[string]any{"configured": ok, "address": address, "enabled": ok && s.proxyEnabled(account)})
+		poolID := ""
+		if s.credentials != nil {
+			if binding, exists := s.credentials.token("linode-proxy-" + account + "/0"); exists && strings.HasPrefix(binding, "pool:") {
+				poolID = strings.TrimPrefix(binding, "pool:")
+			}
+		}
+		send(w, 200, map[string]any{"configured": ok, "address": address, "pool_id": poolID, "enabled": ok && s.proxyEnabled(account)})
 		return
 	case "PUT":
 		var in struct {

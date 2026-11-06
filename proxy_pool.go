@@ -3,8 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io"
-	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -35,6 +33,10 @@ func (s *Server) poolURL(id string) (string, bool) {
 	return "", false
 }
 func (s *Server) proxyPoolAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPut {
+		fail(w, 405, "Method not allowed")
+		return
+	}
 	if s.credentials == nil {
 		fail(w, 503, "代理加密存储未配置")
 		return
@@ -101,6 +103,14 @@ func (s *Server) proxyPoolAPI(w http.ResponseWriter, r *http.Request) {
 			fail(w, 400, "请选择有效账号")
 			return
 		}
+		if in.ID == "" {
+			if err := s.credentials.remove("linode-proxy-" + account + "/0"); err != nil {
+				fail(w, 500, "解除绑定失败")
+				return
+			}
+			send(w, 200, map[string]bool{"saved": true})
+			return
+		}
 		if _, ok := s.poolURL(in.ID); !ok {
 			fail(w, 400, "代理不存在")
 			return
@@ -112,29 +122,4 @@ func (s *Server) proxyPoolAPI(w http.ResponseWriter, r *http.Request) {
 		send(w, 200, map[string]bool{"saved": true})
 		return
 	}
-	raw, ok := s.poolURL(in.ID)
-	if !ok {
-		fail(w, 404, "代理不存在")
-		return
-	}
-	client, err := proxyClient(s.client, raw)
-	if err != nil {
-		fail(w, 400, "代理配置无效")
-		return
-	}
-	defer client.CloseIdleConnections()
-	req, _ := http.NewRequestWithContext(r.Context(), "GET", "https://api.ipify.org", nil)
-	resp, err := client.Do(req)
-	if err != nil {
-		fail(w, 502, safeProxyFailure(err))
-		return
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
-	ip := strings.TrimSpace(string(body))
-	if resp.StatusCode != 200 || net.ParseIP(ip) == nil {
-		fail(w, 502, "出口 IP 查询失败")
-		return
-	}
-	send(w, 200, map[string]string{"ip": ip})
 }

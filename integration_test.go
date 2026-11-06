@@ -15,7 +15,7 @@ import (
 )
 
 func testServer(client *http.Client) *Server {
- return &Server{client:client,status:map[int]Snapshot{},jobs:map[string]Job{}}
+ return &Server{skipBootTuning:true,client:client,status:map[int]Snapshot{},jobs:map[string]Job{}}
 }
 
 func apiRequest(h http.Handler, method,path,body string) *httptest.ResponseRecorder {

@@ -59,6 +59,22 @@ func TestDNSConfigEncryptedAndMatched(t *testing.T) {
 		t.Fatal("delete DNS config failed")
 	}
 }
+
+func TestDNSHTTPErrorIncludesSafeProviderCode(t *testing.T) {
+	upstream := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"Code":"InvalidRR","Message":"bad record AccessKeySecret=do-not-leak"}`))
+	}))
+	defer upstream.Close()
+	s := testServer(upstream.Client())
+	err := s.dnsHTTP(context.Background(), "POST", upstream.URL, nil, nil, &map[string]any{})
+	if err == nil || !strings.Contains(err.Error(), "InvalidRR") || !strings.Contains(err.Error(), "bad record") {
+		t.Fatalf("provider error code/message missing: %v", err)
+	}
+	if strings.Contains(err.Error(), "do-not-leak") {
+		t.Fatalf("provider error leaked a credential: %v", err)
+	}
+}
 func TestCloudflareDNSOnlyChangesExactNode(t *testing.T) {
 	updates := 0
 	cname := false

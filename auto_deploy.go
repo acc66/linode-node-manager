@@ -18,7 +18,7 @@ var deployPython string
 
 func deploymentScript(base, token string, nodeID int, instance Instance, dnsReady ...bool) string {
 	payload, _ := json.Marshal(map[string]any{"panel": base, "token": token, "node_id": nodeID, "ip": publicIP(instance), "ipv6": instance.IPv6, "open_all_ports": instance.OpenAllPorts, "connection_domain": instance.DNSDomain, "dns_wait": len(dnsReady) > 0 && dnsReady[0]})
-	return "set -e\nexport DEBIAN_FRONTEND=noninteractive\nif ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then\n if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq python3 ca-certificates openssl; else echo '自动部署当前要求 Debian/Ubuntu，或预装 python3/openssl'; exit 1; fi\nfi\npython3 - <<'XN_AUTODEPLOY'\n" + deployPython + "\nimport base64\npayload=json.loads(base64.b64decode(" + strconv.Quote(base64.StdEncoding.EncodeToString(payload)) + "))\ntry:\n    deploy(payload)\nexcept Exception as error:\n    message=str(error).replace(payload['token'],'[REDACTED]')\n    print('部署失败：'+message,flush=True)\n    raise SystemExit(1)\nXN_AUTODEPLOY\n"
+	return "set -e\n" + systemTuningScript + "\nexport DEBIAN_FRONTEND=noninteractive\nif ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then\n if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq python3 ca-certificates openssl; else echo '自动部署当前要求 Debian/Ubuntu，或预装 python3/openssl'; exit 1; fi\nfi\npython3 - <<'XN_AUTODEPLOY'\n" + deployPython + "\nimport base64\npayload=json.loads(base64.b64decode(" + strconv.Quote(base64.StdEncoding.EncodeToString(payload)) + "))\ntry:\n    deploy(payload)\nexcept Exception as error:\n    message=str(error).replace(payload['token'],'[REDACTED]')\n    print('部署失败：'+message,flush=True)\n    raise SystemExit(1)\nXN_AUTODEPLOY\n"
 }
 func (s *Server) deploySSH(ctx context.Context, account string, instance Instance, script string, progress ...func(string)) (string, error) {
 	var update func(string)
@@ -40,7 +40,7 @@ func (s *Server) deploySSH(ctx context.Context, account string, instance Instanc
 	known := env("SSH_KNOWN_HOSTS_PATH", "/run/secrets/known_hosts")
 	if _, err := os.Stat(key); err == nil {
 		if _, err := os.Stat(known); err == nil {
-			cmd := exec.CommandContext(ctx, "ssh", "-i", key, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+known, "-o", "ConnectTimeout=8", env("MONITOR_SSH_USER", "root")+"@"+publicIP(instance), "bash -s")
+			cmd := exec.CommandContext(ctx, "ssh", "-i", key, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+known+" "+filepath.Join(env("SSH_BOOTSTRAP_DIR", "/data/ssh-bootstrap"), "known_hosts"), "-o", "ConnectTimeout=8", env("MONITOR_SSH_USER", "root")+"@"+publicIP(instance), "bash -s")
 			cmd.Stdin = strings.NewReader(script)
 			return runDeploymentCommand(cmd, secrets, update)
 		}

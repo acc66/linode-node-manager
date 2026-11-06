@@ -1,174 +1,317 @@
 package main
 
 import (
- "context"
- "crypto/subtle"
- "crypto/sha256"
- "encoding/json"
- "errors"
- "fmt"
- "io"
- "log"
- "net"
- "net/http"
- "net/url"
- "os"
- "os/exec"
- "strconv"
- "strings"
- "sync"
- "time"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"net"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
 type Server struct {
- wp2Mu sync.Mutex
- client *http.Client
- mu sync.RWMutex
- status map[int]Snapshot
- accountStatus map[string]Snapshot
- credentials *accountStore
- accounts *accountStore
- jobs map[string]Job
- sshRun func(context.Context,string,string)(string,error)
+	wp2Mu          sync.Mutex
+	client         *http.Client
+	mu             sync.RWMutex
+	status         map[int]Snapshot
+	accountStatus  map[string]Snapshot
+	credentials    *accountStore
+	accounts       *accountStore
+	jobs           map[string]Job
+	skipBootTuning bool
+	sshRun         func(context.Context, string, string) (string, error)
 }
 type Snapshot struct {
- AccountID string `json:"account_id,omitempty"`
- ID int `json:"id"`
- Label string `json:"label"`
- State string `json:"status"`
- CPU float64 `json:"cpu"`
- Memory float64 `json:"memory"`
- Disk float64 `json:"disk"`
- Uptime float64 `json:"uptime"`
- Service string `json:"service"`
- Failures int `json:"failures"`
- Alert string `json:"alert_state"`
- Updated string `json:"updated_at"`
+	AccountID string  `json:"account_id,omitempty"`
+	ID        int     `json:"id"`
+	Label     string  `json:"label"`
+	State     string  `json:"status"`
+	CPU       float64 `json:"cpu"`
+	Memory    float64 `json:"memory"`
+	Disk      float64 `json:"disk"`
+	Uptime    float64 `json:"uptime"`
+	Service   string  `json:"service"`
+	Failures  int     `json:"failures"`
+	Alert     string  `json:"alert_state"`
+	Updated   string  `json:"updated_at"`
 }
 type Job struct {
- DNSStatus string `json:"dns_status,omitempty"`
- InstanceID int `json:"instance_id,omitempty"`
- TargetID int `json:"target_id,omitempty"`
- AccountID string `json:"account_id,omitempty"`
- ID string `json:"job_id"`
- Status string `json:"status"`
- Log string `json:"log"`
+	Kind          string `json:"kind,omitempty"`
+	HelperID      int    `json:"helper_id,omitempty"`
+	HelperCleaned bool   `json:"helper_cleaned,omitempty"`
+	IPChanged     bool   `json:"ip_changed,omitempty"`
+	OldIP         string `json:"old_ip,omitempty"`
+	NewIP         string `json:"new_ip,omitempty"`
+	DNSStatus     string `json:"dns_status,omitempty"`
+	InstanceID    int    `json:"instance_id,omitempty"`
+	TargetID      int    `json:"target_id,omitempty"`
+	AccountID     string `json:"account_id,omitempty"`
+	ID            string `json:"job_id"`
+	Status        string `json:"status"`
+	Log           string `json:"log"`
 }
 type Instance struct {
- DNSDomain string `json:"-"`
- AccountID string `json:"account_id,omitempty"`
- ID int `json:"id"`
- Label string `json:"label"`
- Status string `json:"status"`
- IPv4 []string `json:"ipv4"`
- IPv6 string `json:"ipv6"`
- Region string `json:"region"`
- Type string `json:"type"`
- PasswordSaved bool `json:"password_saved"`
- OpenAllPorts bool `json:"open_all_ports"`
+	InterfaceGeneration string   `json:"interface_generation,omitempty"`
+	Image               string   `json:"image,omitempty"`
+	DNSDomain           string   `json:"-"`
+	AccountID           string   `json:"account_id,omitempty"`
+	ID                  int      `json:"id"`
+	Label               string   `json:"label"`
+	Status              string   `json:"status"`
+	IPv4                []string `json:"ipv4"`
+	IPv6                string   `json:"ipv6"`
+	Region              string   `json:"region"`
+	Type                string   `json:"type"`
+	PasswordSaved       bool     `json:"password_saved"`
+	OpenAllPorts        bool     `json:"open_all_ports"`
 }
-func env(k,d string)string {if v:=os.Getenv(k);v!="" {return v};return d}
-func number(k string,d int)int {v,e:=strconv.Atoi(os.Getenv(k));if e!=nil{return d};return v}
-func send(w http.ResponseWriter,status int,v any){w.Header().Set("Content-Type","application/json");w.WriteHeader(status);_ =json.NewEncoder(w).Encode(v)}
-func fail(w http.ResponseWriter,status int,e string){send(w,status,map[string]string{"error":e})}
-func safeEqual(a,b string)bool{
- x,y:=sha256.Sum256([]byte(a)),sha256.Sum256([]byte(b))
- return subtle.ConstantTimeCompare(x[:],y[:])==1
-}
-func (s *Server) auth(next http.HandlerFunc)http.HandlerFunc{return func(w http.ResponseWriter,r *http.Request){
- w.Header().Set("Cache-Control","no-store")
- w.Header().Set("X-Content-Type-Options","nosniff")
- w.Header().Set("Referrer-Policy","no-referrer")
- w.Header().Set("X-Frame-Options","DENY")
- w.Header().Set("Content-Security-Policy","default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
- bearer:=os.Getenv("ADMIN_TOKEN")
- user:=os.Getenv("ADMIN_USERNAME")
- pass:=os.Getenv("ADMIN_PASSWORD")
- authorized:=false
- isBearer:=false
- if v:=r.Header.Get("Authorization");bearer!=""&&strings.HasPrefix(v,"Bearer "){
-  authorized=safeEqual(v,"Bearer "+bearer);isBearer=authorized
- }else if u,p,ok:=r.BasicAuth();ok&&user!=""&&len(pass)>=12{
-  authorized=safeEqual(u,user)&&safeEqual(p,pass)
- }
- if !authorized{
-  w.Header().Set("WWW-Authenticate",`Basic realm="Linode Manager", charset="UTF-8"`)
-  fail(w,401,"Unauthorized");return
- }
- if (r.Method=="POST"||r.Method=="DELETE"||r.Method=="PUT"||r.Method=="PATCH")&&!isBearer{
-  if r.Header.Get("Sec-Fetch-Site")=="cross-site"{fail(w,403,"Cross-site request rejected");return}
-  if origin:=r.Header.Get("Origin");origin!=""{
-   u,err:=url.Parse(origin);if err!=nil||u.Host!=r.Host||u.Scheme!="https"&&!(u.Scheme=="http"&&(r.Host=="127.0.0.1:8000"||r.Host=="localhost:8000")){
-    fail(w,403,"Cross-origin request rejected");return
-   }
-  }
-  if r.Header.Get("Content-Type")!="application/json"{fail(w,415,"JSON content type required");return}
- }
- next(w,r.WithContext(useProxyContext(r.Context(),r.URL.Query().Get("use_proxy")=="true")))
-}}
-func (s *Server) request(ctx context.Context,method,endpoint,token string,payload io.Reader)([]byte,int,error){
- req,e:=http.NewRequestWithContext(ctx,method,endpoint,payload);if e!=nil{return nil,0,e}
- req.Header.Set("Authorization","Bearer "+token)
- if payload!=nil{req.Header.Set("Content-Type","application/json")}
- resp,e:=s.client.Do(req);if e!=nil{return nil,0,e};defer resp.Body.Close()
- b,e:=io.ReadAll(io.LimitReader(resp.Body,4<<20));return b,resp.StatusCode,e
-}
-func (s *Server) linode(ctx context.Context,method,path string,payload io.Reader)([]byte,int,error){return s.linodeFor(ctx,"",method,path,payload)}
-func (s *Server) instances(ctx context.Context)([]Instance,error){return s.instancesFor(ctx,"")}
-func (s *Server) instancesFor(ctx context.Context,accountID string)([]Instance,error){
- out:=[]Instance{}
- for page:=1;page<=100;page++{
-  b,status,e:=s.linodeFor(ctx,accountID,"GET",fmt.Sprintf("/linode/instances?page=%d&page_size=100",page),nil)
-  if e!=nil{return nil,e};if status!=200{return nil,fmt.Errorf("Linode HTTP %d",status)}
-  var data struct{Data []Instance `json:"data"`;Pages int `json:"pages"`}
-  if e=json.Unmarshal(b,&data);e!=nil{return nil,e}
-  for _,inst:=range data.Data{inst.AccountID=accountID;if inst.AccountID==""{inst.AccountID="legacy"};inst.PasswordSaved=s.passwordSaved(inst.AccountID,inst.ID);inst.OpenAllPorts=s.openPortsSaved(inst.AccountID,inst.ID);out=append(out,inst)};if page>=data.Pages{break}
- }
- return out,nil
-}
-func (s *Server) wpNodes(w http.ResponseWriter,r *http.Request){
- s.wp2Mu.Lock();defer s.wp2Mu.Unlock()
- session,err:=s.loadWP2Session();if err!=nil{fail(w,409,err.Error());return}
- if session!=nil{
-  nodes,err:=s.adminWP2Nodes(r.Context(),session);if err!=nil{fail(w,409,err.Error());return}
-  send(w,200,map[string]any{"nodes":nodes,"source":"wp2-admin"});return
- }
 
- base:=env("WP2_BASE_URL","");token:=os.Getenv("WP2_API_TOKEN")
- path:=env("WP2_NODES_PATH","/mod_mu/nodes")
- u,e:=url.Parse(base);if e!=nil||u.Scheme!="https"||u.Host==""||u.User!=nil||u.RawQuery!=""||u.Fragment!=""{fail(w,503,"Configure HTTPS WP2_BASE_URL");return}
- if token==""{fail(w,503,"Configure WP2_API_TOKEN");return}
- if path!="/mod_mu/nodes" {fail(w,400,"Unsupported node-list path");return}
- target:=strings.TrimRight(base,"/")+path+"?key="+url.QueryEscape(token)+"&view=manager"
- req,e:=http.NewRequestWithContext(r.Context(),"GET",target,nil);if e!=nil{fail(w,500,"Invalid request");return}
- resp,e:=s.client.Do(req);if e!=nil{fail(w,502,"wp2 unavailable");return};defer resp.Body.Close()
- if resp.StatusCode!=200{fail(w,502,fmt.Sprintf("wp2 HTTP %d",resp.StatusCode));return}
- var data struct{Ret int `json:"ret"`;Data json.RawMessage `json:"data"`;ManagerView bool `json:"manager_view"`}
- if e=json.NewDecoder(io.LimitReader(resp.Body,4<<20)).Decode(&data);e!=nil||data.Ret!=1{fail(w,502,"wp2 returned invalid or rejected response");return}
- var nodes []map[string]any
- if len(data.Data)==0||strings.TrimSpace(string(data.Data))=="null"{fail(w,502,"wp2 returned null node data, not a node list; check WebAPI and source IP permissions");return}
- if e=json.Unmarshal(data.Data,&nodes);e!=nil{fail(w,502,"wp2 nodes response malformed");return}
- // Never forward credentials or full node configuration to the browser.
- safe:=make([]map[string]any,0,len(nodes))
- for _,n:=range nodes{
-  // wp2 /mod_mu/nodes is a node configuration listing, not a live heartbeat feed.
-  safe=append(safe,map[string]any{"id":n["id"],"name":n["name"],"sort":n["sort"],"node_status":"unknown","status_source":"wp2 node listing; no heartbeat"})
- }
- warning:="";if len(safe)==0{warning="wp2 返回空节点列表。旧接口仅支持 sort=0/10/12/13 且要求有 node_ip；请部署 wp2 管理视图补丁。"}
- if len(safe)==0&&data.ManagerView{warning="wp2 管理视图返回空列表，请检查当前 wp2 连接的数据库是否有节点记录。"}
- send(w,200,map[string]any{"nodes":safe,"warning":warning,"manager_view":data.ManagerView})
+func env(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
 }
-func ssh(ctx context.Context,ip,script string)(string,error){
- key:=env("SSH_PRIVATE_KEY_PATH","/run/secrets/linode_ssh_key")
- known:=env("SSH_KNOWN_HOSTS_PATH","/run/secrets/known_hosts")
- if _,e:=os.Stat(key);e!=nil{return "",errors.New("SSH private key not configured")}
- if _,e:=os.Stat(known);e!=nil{return "",errors.New("SSH known_hosts not configured")}
- user:=env("MONITOR_SSH_USER","root")
- cmd:=exec.CommandContext(ctx,"ssh","-i",key,"-o","BatchMode=yes","-o","StrictHostKeyChecking=yes","-o","UserKnownHostsFile="+known,"-o","ConnectTimeout=8",user+"@"+ip,"bash -s")
- cmd.Stdin=strings.NewReader(script);b,e:=cmd.CombinedOutput();return string(b),e
+func number(k string, d int) int {
+	v, e := strconv.Atoi(os.Getenv(k))
+	if e != nil {
+		return d
+	}
+	return v
 }
-func (s *Server) runSSH(ctx context.Context,ip,script string)(string,error){if s.sshRun!=nil{return s.sshRun(ctx,ip,script)};return ssh(ctx,ip,script)}
-func publicIP(i Instance)string{for _,v:=range i.IPv4{ip:=net.ParseIP(v);if ip!=nil&&ip.To4()!=nil&&!ip.IsLoopback()&&!ip.IsPrivate()&&!ip.IsLinkLocalUnicast(){return v}};return ""}
+func send(w http.ResponseWriter, status int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(v)
+}
+func fail(w http.ResponseWriter, status int, e string) {
+	send(w, status, map[string]string{"error": e})
+}
+func safeEqual(a, b string) bool {
+	x, y := sha256.Sum256([]byte(a)), sha256.Sum256([]byte(b))
+	return subtle.ConstantTimeCompare(x[:], y[:]) == 1
+}
+func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("X-Content-Type-Options", "nosniff")
+		w.Header().Set("Referrer-Policy", "no-referrer")
+		w.Header().Set("X-Frame-Options", "DENY")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+		bearer := os.Getenv("ADMIN_TOKEN")
+		user := os.Getenv("ADMIN_USERNAME")
+		pass := os.Getenv("ADMIN_PASSWORD")
+		authorized := false
+		isBearer := false
+		if v := r.Header.Get("Authorization"); bearer != "" && strings.HasPrefix(v, "Bearer ") {
+			authorized = safeEqual(v, "Bearer "+bearer)
+			isBearer = authorized
+		} else if u, p, ok := r.BasicAuth(); ok && user != "" && len(pass) >= 12 {
+			authorized = safeEqual(u, user) && safeEqual(p, pass)
+		}
+		if !authorized {
+			w.Header().Set("WWW-Authenticate", `Basic realm="Linode Manager", charset="UTF-8"`)
+			fail(w, 401, "Unauthorized")
+			return
+		}
+		if (r.Method == "POST" || r.Method == "DELETE" || r.Method == "PUT" || r.Method == "PATCH") && !isBearer {
+			if r.Header.Get("Sec-Fetch-Site") == "cross-site" {
+				fail(w, 403, "Cross-site request rejected")
+				return
+			}
+			if origin := r.Header.Get("Origin"); origin != "" {
+				u, err := url.Parse(origin)
+				if err != nil || u.Host != r.Host || u.Scheme != "https" && !(u.Scheme == "http" && (r.Host == "127.0.0.1:8000" || r.Host == "localhost:8000")) {
+					fail(w, 403, "Cross-origin request rejected")
+					return
+				}
+			}
+			if r.Header.Get("Content-Type") != "application/json" {
+				fail(w, 415, "JSON content type required")
+				return
+			}
+		}
+		next(w, r.WithContext(useProxyContext(r.Context(), r.URL.Query().Get("use_proxy") == "true")))
+	}
+}
+func (s *Server) request(ctx context.Context, method, endpoint, token string, payload io.Reader) ([]byte, int, error) {
+	req, e := http.NewRequestWithContext(ctx, method, endpoint, payload)
+	if e != nil {
+		return nil, 0, e
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+	if payload != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, e := s.client.Do(req)
+	if e != nil {
+		return nil, 0, e
+	}
+	defer resp.Body.Close()
+	b, e := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	return b, resp.StatusCode, e
+}
+func (s *Server) linode(ctx context.Context, method, path string, payload io.Reader) ([]byte, int, error) {
+	return s.linodeFor(ctx, "", method, path, payload)
+}
+func (s *Server) instances(ctx context.Context) ([]Instance, error) { return s.instancesFor(ctx, "") }
+func (s *Server) instancesFor(ctx context.Context, accountID string) ([]Instance, error) {
+	out := []Instance{}
+	for page := 1; page <= 100; page++ {
+		b, status, e := s.linodeFor(ctx, accountID, "GET", fmt.Sprintf("/linode/instances?page=%d&page_size=100", page), nil)
+		if e != nil {
+			return nil, e
+		}
+		if status != 200 {
+			return nil, fmt.Errorf("Linode HTTP %d", status)
+		}
+		var data struct {
+			Data  []Instance `json:"data"`
+			Pages int        `json:"pages"`
+		}
+		if e = json.Unmarshal(b, &data); e != nil {
+			return nil, e
+		}
+		for _, inst := range data.Data {
+			inst.AccountID = accountID
+			if inst.AccountID == "" {
+				inst.AccountID = "legacy"
+			}
+			inst.PasswordSaved = s.passwordSaved(inst.AccountID, inst.ID)
+			inst.OpenAllPorts = s.openPortsSaved(inst.AccountID, inst.ID)
+			out = append(out, inst)
+		}
+		if page >= data.Pages {
+			break
+		}
+	}
+	return out, nil
+}
+func (s *Server) wpNodes(w http.ResponseWriter, r *http.Request) {
+	s.wp2Mu.Lock()
+	defer s.wp2Mu.Unlock()
+	session, err := s.loadWP2Session()
+	if err != nil {
+		fail(w, 409, err.Error())
+		return
+	}
+	if session != nil {
+		nodes, err := s.adminWP2Nodes(r.Context(), session)
+		if err != nil {
+			fail(w, 409, err.Error())
+			return
+		}
+		send(w, 200, map[string]any{"nodes": nodes, "source": "wp2-admin"})
+		return
+	}
+
+	base := env("WP2_BASE_URL", "")
+	token := os.Getenv("WP2_API_TOKEN")
+	path := env("WP2_NODES_PATH", "/mod_mu/nodes")
+	u, e := url.Parse(base)
+	if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		fail(w, 503, "Configure HTTPS WP2_BASE_URL")
+		return
+	}
+	if token == "" {
+		fail(w, 503, "Configure WP2_API_TOKEN")
+		return
+	}
+	if path != "/mod_mu/nodes" {
+		fail(w, 400, "Unsupported node-list path")
+		return
+	}
+	target := strings.TrimRight(base, "/") + path + "?key=" + url.QueryEscape(token) + "&view=manager"
+	req, e := http.NewRequestWithContext(r.Context(), "GET", target, nil)
+	if e != nil {
+		fail(w, 500, "Invalid request")
+		return
+	}
+	resp, e := s.client.Do(req)
+	if e != nil {
+		fail(w, 502, "wp2 unavailable")
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		fail(w, 502, fmt.Sprintf("wp2 HTTP %d", resp.StatusCode))
+		return
+	}
+	var data struct {
+		Ret         int             `json:"ret"`
+		Data        json.RawMessage `json:"data"`
+		ManagerView bool            `json:"manager_view"`
+	}
+	if e = json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(&data); e != nil || data.Ret != 1 {
+		fail(w, 502, "wp2 returned invalid or rejected response")
+		return
+	}
+	var nodes []map[string]any
+	if len(data.Data) == 0 || strings.TrimSpace(string(data.Data)) == "null" {
+		fail(w, 502, "wp2 returned null node data, not a node list; check WebAPI and source IP permissions")
+		return
+	}
+	if e = json.Unmarshal(data.Data, &nodes); e != nil {
+		fail(w, 502, "wp2 nodes response malformed")
+		return
+	}
+	// Never forward credentials or full node configuration to the browser.
+	safe := make([]map[string]any, 0, len(nodes))
+	for _, n := range nodes {
+		// wp2 /mod_mu/nodes is a node configuration listing, not a live heartbeat feed.
+		safe = append(safe, map[string]any{"id": n["id"], "name": n["name"], "sort": n["sort"], "node_status": "unknown", "status_source": "wp2 node listing; no heartbeat"})
+	}
+	warning := ""
+	if len(safe) == 0 {
+		warning = "wp2 返回空节点列表。旧接口仅支持 sort=0/10/12/13 且要求有 node_ip；请部署 wp2 管理视图补丁。"
+	}
+	if len(safe) == 0 && data.ManagerView {
+		warning = "wp2 管理视图返回空列表，请检查当前 wp2 连接的数据库是否有节点记录。"
+	}
+	send(w, 200, map[string]any{"nodes": safe, "warning": warning, "manager_view": data.ManagerView})
+}
+func ssh(ctx context.Context, ip, script string) (string, error) {
+	key := env("SSH_PRIVATE_KEY_PATH", "/run/secrets/linode_ssh_key")
+	known := env("SSH_KNOWN_HOSTS_PATH", "/run/secrets/known_hosts")
+	if _, e := os.Stat(key); e != nil {
+		return "", errors.New("SSH private key not configured")
+	}
+	if _, e := os.Stat(known); e != nil {
+		return "", errors.New("SSH known_hosts not configured")
+	}
+	user := env("MONITOR_SSH_USER", "root")
+	cmd := exec.CommandContext(ctx, "ssh", "-i", key, "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=yes", "-o", "UserKnownHostsFile="+known, "-o", "ConnectTimeout=8", user+"@"+ip, "bash -s")
+	cmd.Stdin = strings.NewReader(script)
+	b, e := cmd.CombinedOutput()
+	return string(b), e
+}
+func (s *Server) runSSH(ctx context.Context, ip, script string) (string, error) {
+	if s.sshRun != nil {
+		return s.sshRun(ctx, ip, script)
+	}
+	return ssh(ctx, ip, script)
+}
+func publicIP(i Instance) string {
+	for _, v := range i.IPv4 {
+		ip := net.ParseIP(v)
+		if ip != nil && ip.To4() != nil && !ip.IsLoopback() && !ip.IsPrivate() && !ip.IsLinkLocalUnicast() {
+			return v
+		}
+	}
+	return ""
+}
+
 const probeScript = `python3 - <<'PY'
 import json,os,time,subprocess
 def cpu():
@@ -182,150 +325,397 @@ svc=subprocess.run(['systemctl','is-active','xboard-node.service'],capture_outpu
 print(json.dumps({'cpu':round(100*(1-(d-b)/max(1,c-a)),1),'memory':round(100*(1-m.get('MemAvailable',0)/max(1,m.get('MemTotal',1))),1),'disk':round(100*(1-free/max(1,total)),1),'uptime':int(float(open('/proc/uptime').read().split()[0])),'service':svc}))
 PY
 `
-func (s *Server) telegram(msg string){
- ctx,cancel:=context.WithTimeout(context.Background(),10*time.Second);defer cancel()
- _=s.sendTelegram(ctx,msg)
+
+func (s *Server) telegram(msg string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = s.sendTelegram(ctx, msg)
 }
-func alertsFor(next Snapshot)string{
- alarms:=[]string{}
- for _,v:=range []struct{Name string;Value float64;Limit int}{{"cpu",next.CPU,number("ALERT_CPU_PERCENT",90)},{"memory",next.Memory,number("ALERT_MEMORY_PERCENT",90)},{"disk",next.Disk,number("ALERT_DISK_PERCENT",90)}}{if v.Value>=float64(v.Limit){alarms=append(alarms,v.Name)}}
- if next.Service!="active"{alarms=append(alarms,"service")}
- return strings.Join(alarms,",")
+func alertsFor(next Snapshot) string {
+	alarms := []string{}
+	for _, v := range []struct {
+		Name  string
+		Value float64
+		Limit int
+	}{{"cpu", next.CPU, number("ALERT_CPU_PERCENT", 90)}, {"memory", next.Memory, number("ALERT_MEMORY_PERCENT", 90)}, {"disk", next.Disk, number("ALERT_DISK_PERCENT", 90)}} {
+		if v.Value >= float64(v.Limit) {
+			alarms = append(alarms, v.Name)
+		}
+	}
+	if next.Service != "active" {
+		alarms = append(alarms, "service")
+	}
+	return strings.Join(alarms, ",")
 }
-func (s *Server) poll(ctx context.Context){
- items,e:=s.instances(ctx);if e!=nil{log.Printf("monitor: Linode list unavailable: %v",e);return}
- for _,inst:=range items{
-  old:=Snapshot{};s.mu.RLock();old=s.status[inst.ID];s.mu.RUnlock()
-  next:=Snapshot{AccountID:"legacy",ID:inst.ID,Label:inst.Label,State:"offline",Updated:time.Now().UTC().Format(time.RFC3339)}
-  if inst.Status=="running"&&publicIP(inst)!=""{
-   c,cancel:=context.WithTimeout(ctx,20*time.Second);output,err:=s.runSSH(c,publicIP(inst),probeScript);cancel()
-   if err==nil{
-    var v struct{CPU float64 `json:"cpu"`;Memory float64 `json:"memory"`;Disk float64 `json:"disk"`;Uptime float64 `json:"uptime"`;Service string `json:"service"`}
-    if json.Unmarshal([]byte(output),&v)==nil&&v.CPU>=0&&v.CPU<=100&&v.Memory>=0&&v.Memory<=100&&v.Disk>=0&&v.Disk<=100&&v.Uptime>=0{next.State="online";next.CPU=v.CPU;next.Memory=v.Memory;next.Disk=v.Disk;next.Uptime=v.Uptime;next.Service=v.Service}
-   }
-  }
-  if next.State=="offline"{next.Failures=old.Failures+1;if next.Failures>=number("ALERT_FAILURE_COUNT",3){next.Alert="offline"}}else{
-   next.Alert=alertsFor(next)
-  }
-  s.mu.Lock();s.status[inst.ID]=next;s.mu.Unlock()
-  if next.Alert!=old.Alert{
-   if next.Alert!=""{go s.telegram(fmt.Sprintf("🚨 Linode %s (#%d): %s",inst.Label,inst.ID,next.Alert))}
-   if next.Alert==""&&old.Alert!=""{go s.telegram(fmt.Sprintf("✅ Linode %s (#%d) recovered",inst.Label,inst.ID))}
-  }
- }
+func (s *Server) poll(ctx context.Context) {
+	items, e := s.instances(ctx)
+	if e != nil {
+		log.Printf("monitor: Linode list unavailable: %v", e)
+		return
+	}
+	for _, inst := range items {
+		old := Snapshot{}
+		s.mu.RLock()
+		old = s.status[inst.ID]
+		s.mu.RUnlock()
+		next := Snapshot{AccountID: "legacy", ID: inst.ID, Label: inst.Label, State: "offline", Updated: time.Now().UTC().Format(time.RFC3339)}
+		if inst.Status == "running" && publicIP(inst) != "" {
+			c, cancel := context.WithTimeout(ctx, 20*time.Second)
+			output, err := s.deploySSH(c, "legacy", inst, probeScript)
+			cancel()
+			if err == nil {
+				var v struct {
+					CPU     float64 `json:"cpu"`
+					Memory  float64 `json:"memory"`
+					Disk    float64 `json:"disk"`
+					Uptime  float64 `json:"uptime"`
+					Service string  `json:"service"`
+				}
+				if json.Unmarshal([]byte(output), &v) == nil && v.CPU >= 0 && v.CPU <= 100 && v.Memory >= 0 && v.Memory <= 100 && v.Disk >= 0 && v.Disk <= 100 && v.Uptime >= 0 {
+					next.State = "online"
+					next.CPU = v.CPU
+					next.Memory = v.Memory
+					next.Disk = v.Disk
+					next.Uptime = v.Uptime
+					next.Service = v.Service
+				}
+			}
+		}
+		if next.State == "offline" {
+			next.Failures = old.Failures + 1
+			if next.Failures >= number("ALERT_FAILURE_COUNT", 3) {
+				next.Alert = "offline"
+			}
+		} else {
+			next.Alert = alertsFor(next)
+		}
+		s.mu.Lock()
+		s.status[inst.ID] = next
+		s.mu.Unlock()
+		if next.Alert != old.Alert {
+			if next.Alert != "" {
+				go s.telegram(fmt.Sprintf("🚨 Linode %s (#%d): %s", inst.Label, inst.ID, next.Alert))
+			}
+			if next.Alert == "" && old.Alert != "" {
+				go s.telegram(fmt.Sprintf("✅ Linode %s (#%d) recovered", inst.Label, inst.ID))
+			}
+		}
+	}
 }
-func (s *Server) monitoring(ctx context.Context){
- ticker:=time.NewTicker(time.Duration(max(30,number("MONITOR_INTERVAL",60)))*time.Second);defer ticker.Stop()
- s.poll(ctx);s.pollAccounts(ctx);for{select{case <-ctx.Done():return;case <-ticker.C:s.poll(ctx);s.pollAccounts(ctx)}}
+func (s *Server) monitoring(ctx context.Context) {
+	ticker := time.NewTicker(time.Duration(max(30, number("MONITOR_INTERVAL", 60))) * time.Second)
+	defer ticker.Stop()
+	s.poll(ctx)
+	s.pollAccounts(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.poll(ctx)
+			s.pollAccounts(ctx)
+		}
+	}
 }
-func (s *Server) install(w http.ResponseWriter,r *http.Request){
- accountID:=r.URL.Query().Get("account_id");if accountID==""{accountID="legacy"}
- if _,err:=s.accountToken(accountID);err!=nil{fail(w,400,"Unknown or unconfigured Linode account");return}
- var in struct{InstanceID int `json:"instance_id"`;Mode string `json:"mode"`;TargetID int `json:"target_id"`}
- if json.NewDecoder(io.LimitReader(r.Body,1<<16)).Decode(&in)!=nil||in.InstanceID<=0||in.TargetID<=0||in.Mode!="node"{fail(w,400,"Valid instance_id, node mode and target_id required");return}
- token:=os.Getenv("WP2_API_TOKEN");base:=env("WP2_BASE_URL","");u,e:=url.Parse(base);if token==""||e!=nil||u.Scheme!="https"||u.Host==""{fail(w,503,"wp2 not configured");return}
- b,st,e:=s.linodeFor(r.Context(),accountID,"GET",fmt.Sprintf("/linode/instances/%d",in.InstanceID),nil);if e!=nil||st!=200{fail(w,502,"Linode instance lookup failed");return}
- var inst Instance;if json.Unmarshal(b,&inst)!=nil||inst.Status!="running"||publicIP(inst)==""{fail(w,409,"Running public IPv4 instance required");return}
- inst.OpenAllPorts=s.openPortsSaved(accountID,inst.ID)
- id:=strconv.FormatInt(time.Now().UnixNano(),36)
- s.mu.Lock()
- for _,job:=range s.jobs{if (job.Status=="queued"||job.Status=="running")&&((job.AccountID==accountID&&job.InstanceID==in.InstanceID)||job.TargetID==in.TargetID){s.mu.Unlock();fail(w,409,"该服务器或 wp2 节点正在安装，请等待当前任务完成");return}}
- s.jobs[id]=Job{ID:id,AccountID:accountID,InstanceID:in.InstanceID,TargetID:in.TargetID,Status:"queued"};s.mu.Unlock()
- go func(){
-  s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,InstanceID:in.InstanceID,TargetID:in.TargetID,Status:"running"};s.mu.Unlock()
-  ctx,cancel:=context.WithTimeout(context.Background(),30*time.Minute);defer cancel()
-  dnsReady,prefix,err:=s.prepareDeploymentDNS(ctx,base,token,in.TargetID,&inst)
-  dnsStatus:="skipped";if dnsReady{dnsStatus="updated"};if err!=nil{dnsStatus="failed"}
-  output:=prefix
-  if err==nil{
-   s.mu.Lock();current:=s.jobs[id];current.Log=prefix;current.DNSStatus=dnsStatus;s.jobs[id]=current;s.mu.Unlock()
-   script:=deploymentScript(base,token,in.TargetID,inst,dnsReady)
-   var remote string;remote,err=s.deploySSH(ctx,accountID,inst,script,func(progress string){
-    text:=prefix+progress;if len(text)>16000{text=text[len(text)-16000:]}
-    s.mu.Lock();current:=s.jobs[id];current.Log=text;current.DNSStatus=dnsStatus;s.jobs[id]=current;s.mu.Unlock()
-   });output+=remote
-  }
-  output=strings.ReplaceAll(output,token,"[REDACTED]")
-  if len(output)>16000{output=output[len(output)-16000:]}
-  state:="success";if err!=nil{state="failed";output+="\nInstallation failed: "+err.Error();if dnsReady{output+="\nDNS 记录已更新并保留，可修复问题后重新安装。"}}
-  s.mu.Lock();s.jobs[id]=Job{ID:id,AccountID:accountID,InstanceID:in.InstanceID,TargetID:in.TargetID,Status:state,Log:output,DNSStatus:dnsStatus};s.mu.Unlock()
- }()
- send(w,202,map[string]string{"job_id":id,"status":"queued"})
+func (s *Server) install(w http.ResponseWriter, r *http.Request) {
+	accountID := r.URL.Query().Get("account_id")
+	if accountID == "" {
+		accountID = "legacy"
+	}
+	if _, err := s.accountToken(accountID); err != nil {
+		fail(w, 400, "Unknown or unconfigured Linode account")
+		return
+	}
+	var in struct {
+		InstanceID int    `json:"instance_id"`
+		Mode       string `json:"mode"`
+		TargetID   int    `json:"target_id"`
+	}
+	if json.NewDecoder(io.LimitReader(r.Body, 1<<16)).Decode(&in) != nil || in.InstanceID <= 0 || in.TargetID <= 0 || in.Mode != "node" {
+		fail(w, 400, "Valid instance_id, node mode and target_id required")
+		return
+	}
+	token := os.Getenv("WP2_API_TOKEN")
+	base := env("WP2_BASE_URL", "")
+	u, e := url.Parse(base)
+	if token == "" || e != nil || u.Scheme != "https" || u.Host == "" {
+		fail(w, 503, "wp2 not configured")
+		return
+	}
+	b, st, e := s.linodeFor(r.Context(), accountID, "GET", fmt.Sprintf("/linode/instances/%d", in.InstanceID), nil)
+	if e != nil || st != 200 {
+		fail(w, 502, "Linode instance lookup failed")
+		return
+	}
+	var inst Instance
+	if json.Unmarshal(b, &inst) != nil || inst.Status != "running" || publicIP(inst) == "" {
+		fail(w, 409, "Running public IPv4 instance required")
+		return
+	}
+	inst.OpenAllPorts = s.openPortsSaved(accountID, inst.ID)
+	id := strconv.FormatInt(time.Now().UnixNano(), 36)
+	s.mu.Lock()
+	for _, job := range s.jobs {
+		if (job.Status == "queued" || job.Status == "running") && ((job.AccountID == accountID && job.InstanceID == in.InstanceID) || job.TargetID == in.TargetID) {
+			s.mu.Unlock()
+			fail(w, 409, "该服务器或 wp2 节点正在安装，请等待当前任务完成")
+			return
+		}
+	}
+	s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, Status: "queued"}
+	s.mu.Unlock()
+	go func() {
+		s.mu.Lock()
+		s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, Status: "running"}
+		s.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		dnsReady, prefix, err := s.prepareDeploymentDNS(ctx, base, token, in.TargetID, &inst)
+		dnsStatus := "skipped"
+		if dnsReady {
+			dnsStatus = "updated"
+		}
+		if err != nil {
+			dnsStatus = "failed"
+		}
+		output := prefix
+		if err == nil {
+			s.mu.Lock()
+			current := s.jobs[id]
+			current.Log = prefix
+			current.DNSStatus = dnsStatus
+			s.jobs[id] = current
+			s.mu.Unlock()
+			script := deploymentScript(base, token, in.TargetID, inst, dnsReady)
+			var remote string
+			remote, err = s.deploySSH(ctx, accountID, inst, script, func(progress string) {
+				text := prefix + progress
+				if len(text) > 16000 {
+					text = text[len(text)-16000:]
+				}
+				s.mu.Lock()
+				current := s.jobs[id]
+				current.Log = text
+				current.DNSStatus = dnsStatus
+				s.jobs[id] = current
+				s.mu.Unlock()
+			})
+			output += remote
+		}
+		output = strings.ReplaceAll(output, token, "[REDACTED]")
+		if len(output) > 16000 {
+			output = output[len(output)-16000:]
+		}
+		state := "success"
+		if err != nil {
+			state = "failed"
+			output += "\nInstallation failed: " + err.Error()
+			if dnsReady {
+				output += "\nDNS 记录已更新并保留，可修复问题后重新安装。"
+			}
+		}
+		if state == "success" {
+			_ = s.saveRootPassword("node-binding-"+accountID, inst.ID, inst.Label, strconv.Itoa(in.TargetID))
+		}
+		s.mu.Lock()
+		s.jobs[id] = Job{ID: id, AccountID: accountID, InstanceID: in.InstanceID, TargetID: in.TargetID, Status: state, Log: output, DNSStatus: dnsStatus}
+		s.mu.Unlock()
+	}()
+	send(w, 202, map[string]string{"job_id": id, "status": "queued"})
 }
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func newHandler(s *Server) http.Handler {
- mux:=http.NewServeMux()
- mux.HandleFunc("GET /api/instances/{id}/backend/logs",s.auth(s.backendLogsAPI))
- mux.HandleFunc("POST /api/dns/discover",s.auth(s.dnsDiscoverAPI))
- mux.HandleFunc("GET /api/telegram/settings",s.auth(s.telegramSettingsAPI))
- mux.HandleFunc("POST /api/telegram/settings",s.auth(s.telegramSettingsAPI))
- mux.HandleFunc("DELETE /api/telegram/settings",s.auth(s.telegramSettingsAPI))
- mux.HandleFunc("POST /api/telegram/test",s.auth(s.telegramTestAPI))
- mux.HandleFunc("GET /api/dns/providers",s.auth(s.dnsProvidersAPI))
- mux.HandleFunc("POST /api/dns/providers",s.auth(s.dnsProvidersAPI))
- mux.HandleFunc("PATCH /api/dns/providers",s.auth(s.dnsProvidersAPI))
- mux.HandleFunc("DELETE /api/dns/providers",s.auth(s.dnsProvidersAPI))
- mux.HandleFunc("GET /api/dns/check",s.auth(s.dnsCheckAPI))
- mux.HandleFunc("GET /api/linode/proxy",s.auth(s.linodeProxyAPI))
- mux.HandleFunc("PUT /api/linode/proxy",s.auth(s.linodeProxyAPI))
- mux.HandleFunc("DELETE /api/linode/proxy",s.auth(s.linodeProxyAPI))
- mux.HandleFunc("GET /api/wp2/session",s.auth(s.wp2SessionAPI))
- mux.HandleFunc("POST /api/wp2/session",s.auth(s.wp2SessionAPI))
- mux.HandleFunc("DELETE /api/wp2/session",s.auth(s.wp2SessionAPI))
- mux.HandleFunc("GET /api/instances/{id}/password",s.auth(s.instancePassword))
- mux.HandleFunc("DELETE /api/instances/{id}",s.auth(s.deleteInstance))
- mux.HandleFunc("POST /api/instances",s.auth(s.createInstance))
- mux.HandleFunc("GET /api/catalog/{kind}",s.auth(s.catalog))
- mux.HandleFunc("GET /",s.auth(func(w http.ResponseWriter,r *http.Request){w.Header().Set("Content-Type","text/html; charset=utf-8");io.WriteString(w,htmlPage)}))
- mux.HandleFunc("GET /api/health",s.auth(func(w http.ResponseWriter,r *http.Request){send(w,200,map[string]string{"status":"ok","language":"go"})}))
- mux.HandleFunc("GET /api/instances",s.auth(func(w http.ResponseWriter,r *http.Request){
-  accountID:=r.URL.Query().Get("account_id")
-  items:=[]Instance{}
-  ids:=[]string{}
-  if accountID!=""{if _,err:=s.accountToken(accountID);err!=nil{fail(w,400,"Unknown account");return};ids=append(ids,accountID)}else{
-   if s.legacyEnabled(){ids=append(ids,"legacy")}
-   if s.accounts!=nil{for _,a:=range s.accounts.list(){ids=append(ids,a.ID)}}
-  }
-  for _,id:=range ids{found,err:=s.instancesFor(r.Context(),id);if err!=nil{fail(w,502,"Linode API unavailable for selected account");return};items=append(items,found...)}
-  send(w,200,map[string]any{"instances":items})
- }))
- mux.HandleFunc("GET /api/instances/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));if e!=nil||id<=0{fail(w,400,"Invalid instance ID");return};b,st,e:=s.linodeFor(r.Context(),r.URL.Query().Get("account_id"),"GET",fmt.Sprintf("/linode/instances/%d",id),nil);if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
- mux.HandleFunc("GET /api/wp2/nodes",s.auth(s.wpNodes))
- mux.HandleFunc("GET /api/accounts",s.auth(s.accountsAPI))
- mux.HandleFunc("POST /api/accounts",s.auth(s.accountsAPI))
- mux.HandleFunc("DELETE /api/accounts/{id}",s.auth(s.deleteAccount))
- mux.HandleFunc("GET /api/monitor",s.auth(func(w http.ResponseWriter,r *http.Request){s.mu.RLock();defer s.mu.RUnlock();items:=[]Snapshot{};for _,v:=range s.status{items=append(items,v)};for _,v:=range s.accountStatus{items=append(items,v)};send(w,200,map[string]any{"instances":items})}))
- mux.HandleFunc("POST /api/deployments/install",s.auth(s.install))
- mux.HandleFunc("GET /api/deployments/{id}",s.auth(func(w http.ResponseWriter,r *http.Request){s.mu.RLock();v,ok:=s.jobs[r.PathValue("id")];s.mu.RUnlock();if !ok{fail(w,404,"Unknown job");return};send(w,200,v)}))
- mux.HandleFunc("POST /api/instances/{id}/{action}",s.auth(func(w http.ResponseWriter,r *http.Request){id,e:=strconv.Atoi(r.PathValue("id"));action:=r.PathValue("action");if e!=nil||id<=0||(action!="boot"&&action!="shutdown"&&action!="reboot"){fail(w,400,"Invalid action");return};b,st,e:=s.linodeFor(r.Context(),r.URL.Query().Get("account_id"),"POST",fmt.Sprintf("/linode/instances/%d/%s",id,action),strings.NewReader("{}"));if e!=nil{fail(w,502,"Linode API unavailable");return};w.Header().Set("Content-Type","application/json");w.WriteHeader(st);w.Write(b)}))
- return mux
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/ip-changes", s.auth(s.ipChangeListAPI))
+	mux.HandleFunc("GET /api/instances/{id}/ip-change-plan", s.auth(s.ipChangePlanAPI))
+	mux.HandleFunc("POST /api/instances/{id}/change-ip", s.auth(s.ipChangeAPI))
+	mux.HandleFunc("POST /api/ip-changes/{job}/cleanup", s.auth(s.ipChangeCleanupAPI))
+	mux.HandleFunc("GET /api/instances/{id}/backend/logs", s.auth(s.backendLogsAPI))
+	mux.HandleFunc("POST /api/dns/discover", s.auth(s.dnsDiscoverAPI))
+	mux.HandleFunc("GET /api/telegram/settings", s.auth(s.telegramSettingsAPI))
+	mux.HandleFunc("POST /api/telegram/settings", s.auth(s.telegramSettingsAPI))
+	mux.HandleFunc("DELETE /api/telegram/settings", s.auth(s.telegramSettingsAPI))
+	mux.HandleFunc("POST /api/telegram/test", s.auth(s.telegramTestAPI))
+	mux.HandleFunc("GET /api/dns/providers", s.auth(s.dnsProvidersAPI))
+	mux.HandleFunc("POST /api/dns/providers", s.auth(s.dnsProvidersAPI))
+	mux.HandleFunc("PATCH /api/dns/providers", s.auth(s.dnsProvidersAPI))
+	mux.HandleFunc("DELETE /api/dns/providers", s.auth(s.dnsProvidersAPI))
+	mux.HandleFunc("GET /api/dns/check", s.auth(s.dnsCheckAPI))
+	mux.HandleFunc("GET /api/linode/proxy", s.auth(s.linodeProxyAPI))
+	mux.HandleFunc("PUT /api/linode/proxy", s.auth(s.linodeProxyAPI))
+	mux.HandleFunc("DELETE /api/linode/proxy", s.auth(s.linodeProxyAPI))
+	mux.HandleFunc("GET /api/wp2/session", s.auth(s.wp2SessionAPI))
+	mux.HandleFunc("POST /api/wp2/session", s.auth(s.wp2SessionAPI))
+	mux.HandleFunc("DELETE /api/wp2/session", s.auth(s.wp2SessionAPI))
+	mux.HandleFunc("GET /api/instances/{id}/password", s.auth(s.instancePassword))
+	mux.HandleFunc("DELETE /api/instances/{id}", s.auth(s.deleteInstance))
+	mux.HandleFunc("POST /api/instances", s.auth(s.createInstance))
+	mux.HandleFunc("GET /api/catalog/{kind}", s.auth(s.catalog))
+	mux.HandleFunc("GET /", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		io.WriteString(w, htmlPage)
+	}))
+	mux.HandleFunc("GET /api/health", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		send(w, 200, map[string]string{"status": "ok", "language": "go"})
+	}))
+	mux.HandleFunc("GET /api/instances", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		accountID := r.URL.Query().Get("account_id")
+		items := []Instance{}
+		ids := []string{}
+		if accountID != "" {
+			if _, err := s.accountToken(accountID); err != nil {
+				fail(w, 400, "Unknown account")
+				return
+			}
+			ids = append(ids, accountID)
+		} else {
+			if s.legacyEnabled() {
+				ids = append(ids, "legacy")
+			}
+			if s.accounts != nil {
+				for _, a := range s.accounts.list() {
+					ids = append(ids, a.ID)
+				}
+			}
+		}
+		for _, id := range ids {
+			found, err := s.instancesFor(r.Context(), id)
+			if err != nil {
+				fail(w, 502, "Linode API unavailable for selected account")
+				return
+			}
+			items = append(items, found...)
+		}
+		send(w, 200, map[string]any{"instances": items})
+	}))
+	mux.HandleFunc("GET /api/instances/{id}", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		id, e := strconv.Atoi(r.PathValue("id"))
+		if e != nil || id <= 0 {
+			fail(w, 400, "Invalid instance ID")
+			return
+		}
+		b, st, e := s.linodeFor(r.Context(), r.URL.Query().Get("account_id"), "GET", fmt.Sprintf("/linode/instances/%d", id), nil)
+		if e != nil {
+			fail(w, 502, "Linode API unavailable")
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(st)
+		w.Write(b)
+	}))
+	mux.HandleFunc("GET /api/wp2/nodes", s.auth(s.wpNodes))
+	mux.HandleFunc("GET /api/accounts", s.auth(s.accountsAPI))
+	mux.HandleFunc("POST /api/accounts", s.auth(s.accountsAPI))
+	mux.HandleFunc("DELETE /api/accounts/{id}", s.auth(s.deleteAccount))
+	mux.HandleFunc("GET /api/monitor", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		items := []Snapshot{}
+		for _, v := range s.status {
+			items = append(items, v)
+		}
+		for _, v := range s.accountStatus {
+			items = append(items, v)
+		}
+		send(w, 200, map[string]any{"instances": items})
+	}))
+	mux.HandleFunc("POST /api/deployments/install", s.auth(s.install))
+	mux.HandleFunc("GET /api/deployments/{id}", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		s.mu.RLock()
+		v, ok := s.jobs[r.PathValue("id")]
+		s.mu.RUnlock()
+		if !ok {
+			if op, err := s.loadIPChange(r.PathValue("id")); err == nil {
+				v = op.Job
+				ok = true
+				if v.Status == "queued" || v.Status == "running" {
+					v.Status = "interrupted"
+					v.Log += "\n管理程序重启，换 IP 未自动继续。请核对原机/临时实例及计费状态，必要时清理临时实例。"
+				}
+			}
+		}
+		if !ok {
+			fail(w, 404, "Unknown job")
+			return
+		}
+		send(w, 200, v)
+	}))
+	mux.HandleFunc("POST /api/instances/{id}/{action}", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		id, e := strconv.Atoi(r.PathValue("id"))
+		action := r.PathValue("action")
+		if e != nil || id <= 0 || (action != "boot" && action != "shutdown" && action != "reboot") {
+			fail(w, 400, "Invalid action")
+			return
+		}
+		if s.instanceChangingIP(r.URL.Query().Get("account_id"), id) {
+			fail(w, 409, "该实例正在换 IP，请等待任务完成")
+			return
+		}
+		b, st, e := s.linodeFor(r.Context(), r.URL.Query().Get("account_id"), "POST", fmt.Sprintf("/linode/instances/%d/%s", id, action), strings.NewReader("{}"))
+		if e != nil {
+			fail(w, 502, "Linode API unavailable")
+			return
+		}
+		if st >= 200 && st < 300 && action == "boot" {
+			enabled, _ := r.Context().Value(proxyContextKey{}).(bool)
+			if jobID := s.queueBootTuning(r.URL.Query().Get("account_id"), id, enabled); jobID != "" {
+				send(w, st, map[string]string{"status": "boot_requested", "boot_job_id": jobID})
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(st)
+		w.Write(b)
+	}))
+	return mux
 }
-func main(){
- transport:=http.DefaultTransport.(*http.Transport).Clone();transport.Proxy=nil
- if err:=validateAdminConfig();err!=nil{log.Fatal("Invalid administrator configuration: ",err)}
- s:=&Server{client:&http.Client{Transport:transport,Timeout:35*time.Second,CheckRedirect:func(_ *http.Request,_ []*http.Request)error{return http.ErrUseLastResponse}},status:map[int]Snapshot{},accountStatus:map[string]Snapshot{},jobs:map[string]Job{}}
- if key:=os.Getenv("ACCOUNT_ENCRYPTION_KEY");key!=""{
-  store,err:=initAccounts(env("ACCOUNTS_FILE","/data/accounts.enc"),key)
-  if err!=nil{log.Fatal("Cannot load encrypted accounts: ",err)}
-  s.accounts=store
-  credentials,err:=initAccounts(env("INSTANCE_CREDENTIALS_FILE","/data/instance-credentials.enc"),key)
-  if err!=nil{log.Fatal("Cannot load encrypted instance credentials: ",err)}
-  s.credentials=credentials
- }
+func main() {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	if err := validateAdminConfig(); err != nil {
+		log.Fatal("Invalid administrator configuration: ", err)
+	}
+	s := &Server{client: &http.Client{Transport: transport, Timeout: 35 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}, status: map[int]Snapshot{}, accountStatus: map[string]Snapshot{}, jobs: map[string]Job{}}
+	if key := os.Getenv("ACCOUNT_ENCRYPTION_KEY"); key != "" {
+		store, err := initAccounts(env("ACCOUNTS_FILE", "/data/accounts.enc"), key)
+		if err != nil {
+			log.Fatal("Cannot load encrypted accounts: ", err)
+		}
+		s.accounts = store
+		credentials, err := initAccounts(env("INSTANCE_CREDENTIALS_FILE", "/data/instance-credentials.enc"), key)
+		if err != nil {
+			log.Fatal("Cannot load encrypted instance credentials: ", err)
+		}
+		s.credentials = credentials
+	}
 
- mux:=newHandler(s)
- ctx,cancel:=context.WithCancel(context.Background());defer cancel()
- if env("MONITOR_ENABLED","false")=="true"{go s.monitoring(ctx)}
- addr:=env("LISTEN_ADDR","0.0.0.0:8000");log.Printf("Linode Node Manager Go listening on %s",addr);log.Fatal(http.ListenAndServe(addr,mux))
+	mux := newHandler(s)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// The dashboard's CPU/RAM/Disk cards depend on this poller. Start it by
+	// default; deployments can still opt out explicitly for constrained hosts.
+	if env("MONITOR_ENABLED", "true") != "false" {
+		go s.monitoring(ctx)
+	}
+	addr := env("LISTEN_ADDR", "0.0.0.0:8000")
+	log.Printf("Linode Node Manager Go listening on %s", addr)
+	log.Fatal(http.ListenAndServe(addr, mux))
 }
-func validateAdminConfig()error{
- user,pass:=os.Getenv("ADMIN_USERNAME"),os.Getenv("ADMIN_PASSWORD")
- if user!=""||pass!=""{
-  if user==""{return errors.New("ADMIN_USERNAME is required when ADMIN_PASSWORD is set")}
-  if len(pass)<12{return errors.New("ADMIN_PASSWORD must be at least 12 characters; update .env and recreate the manager container")}
- }else if os.Getenv("ADMIN_TOKEN")==""{return errors.New("configure ADMIN_USERNAME and ADMIN_PASSWORD, or ADMIN_TOKEN for API-only access")}
- return nil
+func validateAdminConfig() error {
+	user, pass := os.Getenv("ADMIN_USERNAME"), os.Getenv("ADMIN_PASSWORD")
+	if user != "" || pass != "" {
+		if user == "" {
+			return errors.New("ADMIN_USERNAME is required when ADMIN_PASSWORD is set")
+		}
+		if len(pass) < 12 {
+			return errors.New("ADMIN_PASSWORD must be at least 12 characters; update .env and recreate the manager container")
+		}
+	} else if os.Getenv("ADMIN_TOKEN") == "" {
+		return errors.New("configure ADMIN_USERNAME and ADMIN_PASSWORD, or ADMIN_TOKEN for API-only access")
+	}
+	return nil
 }
+
 const htmlPage = `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -347,16 +737,17 @@ const htmlPage = `<!doctype html>
 <section id="servers"><div class="section-header"><div><h2>服务器实例</h2><p id="msg" class="message">正在加载服务器…</p></div><button onclick="load()">↻ 刷新</button></div><div id="instances" class="table-wrap"></div></section>
 <section id="create"><div class="section-header"><div><h2>创建 Linode</h2><p>选择套餐与地区，确认费用后创建</p></div><span class="tag">新实例</span></div><div class="toolbar" style="margin-bottom:16px"><button onclick="catalogs()">加载地区、套餐和系统</button><span class="desktop-note">选项来自当前 Linode 账号</span></div><div class="grid"><label>服务器名称<input id="createlabel" placeholder="例如：jp-node-01" maxlength="64"></label><label>地区<select id="createregion"><option value="">请先加载选项</option></select></label><label>套餐<select id="createtype"><option value="">请先加载选项</option></select></label><label>系统镜像<select id="createimage"><option value="">请先加载选项</option></select></label><label class="span-all">Root 密码<input id="createpass" type="password" autocomplete="new-password" placeholder="至少 12 位，创建后加密保存"></label></div><div class="action-row"><label class="check"><input id="openallports" type="checkbox" checked>新实例默认放行全部端口</label><button class="primary" id="createbutton" onclick="createInstance()">创建并开机</button></div><p id="createmsg" class="message"></p></section>
 <section id="wp2"><div class="section-header"><div><h2>wp2 节点</h2><p>连接管理员账号，同步全部节点</p></div><button onclick="nodes()">↻ 同步节点</button></div><p id="wp2connection" class="message"></p><details class="subpanel"><summary>连接或更换 wp2 账号</summary><div class="grid"><label>管理员邮箱<input id="wp2email" type="email" autocomplete="username" placeholder="admin@example.com"></label><label>管理员密码<input id="wp2password" type="password" autocomplete="off" placeholder="密码仅用于本次登录"></label><label class="span-all">两步动态码（如启用）<input id="wp2code" inputmode="numeric" maxlength="6" autocomplete="one-time-code" placeholder="6 位动态码"></label></div><div class="toolbar" style="margin-top:14px"><button class="primary" id="wp2connect" onclick="connectWP2()">连接 wp2</button><button class="danger" onclick="disconnectWP2()">断开连接</button></div><p class="hint">登录会话加密保存在管理机，密码不保存。</p></details><p id="nodehint" class="message">正在加载节点…</p><details class="reveal"><summary>浏览节点列表 · 搜索 / 分页</summary><input id="nodesearch" placeholder="搜索节点名称或 ID" aria-label="搜索节点" oninput="nodePage=0;renderNodes()"><div id="nodes" style="margin-top:12px"></div><div class="pagination"><button id="nodesprev" onclick="nodePage--;renderNodes()">上一页</button><span id="nodespage"></span><button id="nodesnext" onclick="nodePage++;renderNodes()">下一页</button></div></details></section>
-<section id="deploy"><div class="section-header"><div><h2>自动安装后端</h2><p>选择实例和节点，自动检查配置、证书与服务</p></div><span class="tag">XboardNode-Plus</span></div><p id="installaccount" class="message">请先选择 Linode 账号</p><div class="grid" style="margin-top:14px"><label><span><span class="step-number">1</span>安装到哪台服务器</span><select id="instance" onchange="updateDNSTarget()"><option value="">请先选择账号并加载服务器</option></select></label><label><span><span class="step-number">2</span>绑定哪个 wp2 节点</span><select id="node" onchange="updateDNSTarget()"><option value="">请先同步 wp2 节点</option></select></label></div><div class="action-row"><span class="desktop-note">DNS 自动解析按下方启用的域名配置匹配</span><div class="toolbar"><button onclick="backendLogs()" id="backendlogbutton">查看后端日志</button><button class="primary" id="installbutton" onclick="install()">自动安装并验证</button></div></div><pre id="joblog" aria-live="polite"></pre><details class="subpanel"><summary>查询历史任务</summary><div class="toolbar"><input id="job" placeholder="任务 ID" aria-label="任务 ID"><button onclick="job()">查询任务</button></div></details></section>
+<section id="deploy"><div class="section-header"><div><h2>自动安装后端</h2><p>选择实例和节点，自动检查配置、证书与服务</p></div><span class="tag">XboardNode-Plus</span></div><p id="installaccount" class="message">请先选择 Linode 账号</p><div class="grid" style="margin-top:14px"><label><span><span class="step-number">1</span>安装到哪台服务器</span><select id="instance" onchange="updateDNSTarget()"><option value="">请先选择账号并加载服务器</option></select></label><label><span><span class="step-number">2</span>绑定哪个 wp2 节点</span><select id="node" onchange="updateDNSTarget()"><option value="">请先同步 wp2 节点</option></select></label></div><div class="action-row"><span class="desktop-note">DNS 自动解析按下方启用的域名配置匹配</span><div class="toolbar"><button onclick="backendLogs()" id="backendlogbutton">查看后端日志</button><button class="primary" id="installbutton" onclick="install()">自动安装并验证</button></div></div><pre id="joblog" aria-live="polite"></pre><button id="ipcleanup" hidden onclick="cleanupIPChange()">清理残留临时实例</button><details class="subpanel"><summary>最近换 IP 任务</summary><button onclick="loadIPChanges()">刷新任务</button><div id="ipchanges"></div></details><details class="subpanel"><summary>查询历史任务</summary><div class="toolbar"><input id="job" placeholder="任务 ID" aria-label="任务 ID"><button onclick="job()">查询任务</button></div></details></section>
 <section id="dns"><div class="section-header"><div><h2>DNS 自动解析与证书</h2><p>配置一次密钥，安装时按节点域名自动匹配</p></div><span class="tag">加密保存</span></div><p id="dnstarget" class="message">请选择安装目标服务器，DNS 将指向该实例公网 IP。</p><div id="dnsconfigs"></div><p id="dnsmsg" class="message"></p><details class="subpanel"><summary>添加 DNS 域名与密钥</summary><div class="grid"><label>DNS 服务商<select id="dnsprovider" onchange="dnsFields()"><option value="cloudflare">Cloudflare</option><option value="alidns">阿里云 DNS</option></select></label><label>托管域名<input id="dnszone" placeholder="填写 Key 后可自动读取，或手动填写"></label><div class="span-all"><div class="toolbar"><button id="dnsdiscover" onclick="discoverDNS()">读取托管域名并匹配节点</button><select id="dnszones" aria-label="已读取的托管域名" onchange="document.getElementById('dnszone').value=this.value"><option value="">先填写 Key，再读取域名</option></select></div></div><span id="cfkeyfields" class="span-all"><label>Cloudflare API Token<input id="dnstoken" type="password" autocomplete="off" placeholder="需要 Zone Read / DNS Edit 权限"></label></span><span id="alikeyfields" class="span-all" hidden><label>阿里云 AccessKey ID<input id="dnsaccessid" type="password" autocomplete="off" placeholder="RAM AccessKey ID"></label><label>阿里云 AccessKey Secret<input id="dnssecret" type="password" autocomplete="off" placeholder="RAM AccessKey Secret"></label></span></div><div class="action-row"><label class="check"><input id="dnsenabled" type="checkbox" checked>安装时自动更新 DNS</label><button class="primary" onclick="saveDNS()">加密保存 DNS 配置</button></div><p class="hint">只更新节点子域名 A/AAAA；Cloudflare 使用灰云。根域名、面板地址和 CNAME 不自动修改。</p></details></section>
 <section id="telegram"><div class="section-header"><div><h2>Telegram 提醒</h2><p>直接配置机器人，接收监控异常与恢复通知</p></div><span class="tag">消息通知</span></div><p id="tgstatus" class="message"></p><details class="subpanel"><summary>设置机器人与接收聊天</summary><div class="grid"><label>Bot Token<input id="tgtoken" type="password" autocomplete="off" placeholder="由 BotFather 获取；留空保留已保存 Token"></label><label>Chat ID<input id="tgchat" placeholder="个人 ID、群组负数 ID 或 @频道用户名"></label></div><div class="action-row"><label class="check"><input id="tgenabled" type="checkbox" checked>启用 Telegram 提醒</label><button class="primary" onclick="saveTelegram()">加密保存</button></div><p class="hint">个人聊天请先向机器人发送 /start；群组或频道需允许机器人发消息。告警依赖资源监控运行。</p></details><div class="toolbar" style="margin-top:14px"><button id="tgtest" onclick="testTelegram()">发送测试消息</button><button class="danger" onclick="removeTelegram()">移除网页配置</button></div><p id="tgmsg" class="message"></p></section><section id="monitor"><div class="section-header"><div><h2>资源监控</h2><p>CPU / 内存 / 磁盘 · 数据来自 SSH 监控</p></div><button onclick="monitor()">↻ 刷新</button></div><pre id="metrics"></pre></section>
 <p class="footnote">Linode Node Manager · 通过 HTTPS 访问 · 凭据加密存储</p>
 </main>
+<dialog id="ipchangedialog"><h2>保留原机 · 更换公网 IPv4</h2><p id="ipsummary" class="message"></p><p class="hint">会创建同地区临时实例取得新 IP，短暂关闭原机、交换 IPv4、恢复原机，再清理临时实例。原机磁盘、密码和后端配置保留。新 IP 是否可用需由你的网络验证。</p><label>临时实例套餐（会计费）<select id="ipplan"></select></label><label style="margin-top:12px">换 IP 后同步哪个 wp2 节点<select id="ipnode"></select></label><p class="hint">不选节点则不自动更新 DNS。套餐价格为参考，地区和最终账单以 Linode 为准。</p><label class="check"><input id="ipbilling" type="checkbox">我确认临时实例费用和短暂关机</label><p id="iperror" class="message"></p><div class="toolbar"><button class="primary" id="ipconfirm" onclick="startIPChange()">确认换 IP</button><button onclick="document.getElementById('ipchangedialog').close()">取消</button></div></dialog>
 <dialog id="passworddialog" onclose="document.getElementById('savedpassword').value=''"><h2>Root 密码</h2><p class="hint">仅在此处显示，关闭后清空</p><input id="savedpassword" type="text" readonly autocomplete="off" aria-label="已保存的 Root 密码"><button onclick="document.getElementById('passworddialog').close()">关闭并清除</button></dialog>
 <script>async function api(path,options={}){if(path==='/instances'||path.startsWith('/instances/')||path==='/deployments/install'||path.startsWith('/catalog/')||path==='/linode/proxy'){let a=document.getElementById('account').value;if(a&&!path.includes('account_id='))path+=(path.includes('?')?'&':'?')+'account_id='+encodeURIComponent(a);if(document.getElementById('useproxy').checked&&path!='/linode/proxy'&&!path.startsWith('/linode/proxy?'))path+=(path.includes('?')?'&':'?')+'use_proxy=true'}let r=await fetch('/api'+path,{...options,credentials:'same-origin',headers:{'Content-Type':'application/json'}});let j=await r.json();if(!r.ok)throw Error(j.error||r.status);return j}async function loadAccounts(){let box=document.getElementById('account'),old=box.value;try{let data=await api('/accounts');box.replaceChildren();let all=document.createElement('option');all.value='';all.textContent='全部账号（仅查看）';box.appendChild(all);for(let a of data.accounts){let o=document.createElement('option');o.value=a.id;o.textContent=a.name;box.appendChild(o)}box.value=old&&Array.from(box.options).some(o=>o.value===old)?old:(data.accounts.length===1?data.accounts[0].id:'');document.getElementById('accountmsg').textContent='已加载 '+data.accounts.length+' 个账号'}catch(e){document.getElementById('accountmsg').textContent=e.message}}
 async function addAccount(){let name=document.getElementById('accountname').value.trim(),token=document.getElementById('accounttoken').value;if(!name||token.length<20){document.getElementById('accountmsg').textContent='请输入账号备注和有效 Token';return}try{let a=await api('/accounts',{method:'POST',body:JSON.stringify({name,token})});document.getElementById('accounttoken').value='';await loadAccounts();document.getElementById('account').value=a.id;await load();document.getElementById('accountmsg').textContent='已添加：'+a.name}catch(e){document.getElementById('accountmsg').textContent=e.message}}
 async function deleteAccount(){let id=document.getElementById('account').value;if(!id){document.getElementById('accountmsg').textContent='请先选择要移除的 Linode 账号';return}if(!confirm('删除此账号凭据？不会删除 Linode 实例。'))return;try{await api('/accounts/'+encodeURIComponent(id),{method:'DELETE'});await loadAccounts();await load()}catch(e){document.getElementById('accountmsg').textContent=e.message}}
-const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function power(id,action){if(!document.getElementById('account').value){document.getElementById('msg').textContent='请先选择目标账号，不能在全部账号视图操作';return}if(!confirm('确认对实例 '+id+' 执行 '+action+'？'))return;try{await api('/instances/'+id+'/'+action,{method:'POST'});await load()}catch(e){document.getElementById('msg').textContent=e.message}}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){const selectedAccount=document.getElementById('account').value;const target=document.getElementById('instance'),previous=installationAccount===selectedAccount?target.value:'';installationAccount='';target.replaceChildren();document.getElementById('instances').textContent='正在加载当前账号服务器…';updateDNSTarget();try{let d=await api('/instances');if(document.getElementById('account').value!==selectedAccount)return;updateInstallTargets(d.instances,selectedAccount,previous);document.getElementById('instances').innerHTML='<table><tr><th>Linode 账号</th><th>ID</th><th>名称</th><th>状态</th><th>IP 地址</th><th>地区 / 套餐</th><th>操作</th></tr>'+d.instances.map((i,index)=>'<tr><td data-label="账号">'+esc(accountLabel(i.account_id))+'</td><td data-label="实例 ID">'+Number(i.id)+'</td><td data-label="名称">'+esc(i.label)+'</td><td data-label="状态"><span class="status-pill '+esc(i.status)+'">'+esc(i.status)+'</span></td><td data-label="IP 地址">'+esc((i.ipv4||[]).join(', ')||'分配中')+(i.ipv6?'<br>'+esc(i.ipv6):'')+'</td><td data-label="地区 / 套餐">'+esc(i.region)+'<br>'+esc(i.type)+'</td><td><button '+(!selectedAccount||i.status!=='offline'?'disabled':'')+' onclick="power('+Number(i.id)+',\'boot\')">开机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'shutdown\')">关机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'reboot\')">重启</button><button data-action="password" data-index="'+index+'" '+(i.password_saved?'':'disabled')+'>查看密码</button><button class="danger" data-action="delete" data-index="'+index+'">删除实例</button></td></tr>').join('')+'</table>';document.getElementById('instances').querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>instanceOperation(d.instances[Number(button.dataset.index)],button.dataset.action));document.getElementById('msg').textContent=d.instances.length?'已加载 '+d.instances.length+' 台；选择目标账号后可使用每行的开机、关机、重启按钮':'当前账号没有实例，请检查 Linode API Token 或选择其他账号'}catch(e){document.getElementById('msg').textContent='服务器列表加载失败：'+e.message}}async function nodes(){document.getElementById('nodehint').textContent='正在同步 wp2 节点…';try{let d=await api('/wp2/nodes');let a=d.nodes||[];let sel=document.getElementById('node');sel.replaceChildren();let empty=document.createElement('option');empty.value='';empty.textContent='请选择 wp2 节点';sel.appendChild(empty);for(let n of a){let o=document.createElement('option');o.value=String(n.id);o.textContent=String(n.name||'节点')+' (#'+n.id+')';sel.appendChild(o)}nodeCache=a;nodePage=0;renderNodes();document.getElementById('nodehint').textContent=a.length?'已同步 '+a.length+' 个节点；在线状态：待心跳接口验证':(d.warning||'wp2 接口返回 0 个节点，请检查 wp2 节点配置与 API 访问权限')}catch(e){nodeCache=[];nodePage=0;renderNodes();document.getElementById('node').replaceChildren();document.getElementById('nodehint').textContent='wp2 同步失败：'+e.message}}async function monitor(){try{let d=(await api('/monitor')).instances,id=document.getElementById('account').value;show('metrics',id?d.filter(i=>i.account_id===id):d)}catch(e){show('metrics',e.message)}}async function install(){
+const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));async function power(id,action){if(!document.getElementById('account').value){document.getElementById('msg').textContent='请先选择目标账号，不能在全部账号视图操作';return}if(!confirm('确认对实例 '+id+' 执行 '+action+'？'))return;try{const result=await api('/instances/'+id+'/'+action,{method:'POST'});await load();if(result.boot_job_id){document.getElementById('job').value=result.boot_job_id;watchJob(result.boot_job_id)}}catch(e){document.getElementById('msg').textContent=e.message}}const show=(id,x)=>document.getElementById(id).textContent=JSON.stringify(x,null,2);async function load(){const selectedAccount=document.getElementById('account').value;const target=document.getElementById('instance'),previous=installationAccount===selectedAccount?target.value:'';installationAccount='';target.replaceChildren();document.getElementById('instances').textContent='正在加载当前账号服务器…';updateDNSTarget();try{let d=await api('/instances');if(document.getElementById('account').value!==selectedAccount)return;updateInstallTargets(d.instances,selectedAccount,previous);document.getElementById('instances').innerHTML='<table><tr><th>Linode 账号</th><th>ID</th><th>名称</th><th>状态</th><th>IP 地址</th><th>地区 / 套餐</th><th>操作</th></tr>'+d.instances.map((i,index)=>'<tr><td data-label="账号">'+esc(accountLabel(i.account_id))+'</td><td data-label="实例 ID">'+Number(i.id)+'</td><td data-label="名称">'+esc(i.label)+'</td><td data-label="状态"><span class="status-pill '+esc(i.status)+'">'+esc(i.status)+'</span></td><td data-label="IP 地址">'+esc((i.ipv4||[]).join(', ')||'分配中')+(i.ipv6?'<br>'+esc(i.ipv6):'')+'</td><td data-label="地区 / 套餐">'+esc(i.region)+'<br>'+esc(i.type)+'</td><td><button '+(!selectedAccount||i.status!=='offline'?'disabled':'')+' onclick="power('+Number(i.id)+',\'boot\')">开机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'shutdown\')">关机</button><button '+(!selectedAccount||i.status!=='running'?'disabled':'')+' onclick="power('+Number(i.id)+',\'reboot\')">重启</button><button data-action="password" data-index="'+index+'" '+(i.password_saved?'':'disabled')+'>查看密码</button><button data-action="changeip" data-index="'+index+'">更换 IPv4</button><button class="danger" data-action="delete" data-index="'+index+'">删除实例</button></td></tr>').join('')+'</table>';document.getElementById('instances').querySelectorAll('[data-action]').forEach(button=>button.onclick=()=>instanceOperation(d.instances[Number(button.dataset.index)],button.dataset.action));document.getElementById('msg').textContent=d.instances.length?'已加载 '+d.instances.length+' 台；选择目标账号后可使用每行的开机、关机、重启按钮':'当前账号没有实例，请检查 Linode API Token 或选择其他账号'}catch(e){document.getElementById('msg').textContent='服务器列表加载失败：'+e.message}}async function nodes(){document.getElementById('nodehint').textContent='正在同步 wp2 节点…';try{let d=await api('/wp2/nodes');let a=d.nodes||[];let sel=document.getElementById('node');sel.replaceChildren();let empty=document.createElement('option');empty.value='';empty.textContent='请选择 wp2 节点';sel.appendChild(empty);for(let n of a){let o=document.createElement('option');o.value=String(n.id);o.textContent=String(n.name||'节点')+' (#'+n.id+')';sel.appendChild(o)}nodeCache=a;nodePage=0;renderNodes();document.getElementById('nodehint').textContent=a.length?'已同步 '+a.length+' 个节点；在线状态：待心跳接口验证':(d.warning||'wp2 接口返回 0 个节点，请检查 wp2 节点配置与 API 访问权限')}catch(e){nodeCache=[];nodePage=0;renderNodes();document.getElementById('node').replaceChildren();document.getElementById('nodehint').textContent='wp2 同步失败：'+e.message}}async function monitor(){try{let d=(await api('/monitor')).instances,id=document.getElementById('account').value;show('metrics',id?d.filter(i=>i.account_id===id):d)}catch(e){show('metrics',e.message)}}async function install(){
  const button=document.getElementById('installbutton'),account=document.getElementById('account'),instance=document.getElementById('instance'),node=document.getElementById('node');
  if(button.disabled)return;
  if(!account.value){show('joblog','请先选择目标 Linode 账号');return}
@@ -366,9 +757,10 @@ const esc=x=>String(x??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&g
  button.disabled=true;
  try{const result=await api('/deployments/install',{method:'POST',body:JSON.stringify({instance_id:Number(instance.value),mode:'node',target_id:Number(node.value)})});document.getElementById('job').value=result.job_id;show('joblog',result);watchJob(result.job_id)}catch(e){button.disabled=false;show('joblog',e.message)}
 }
-async function job(){try{show('joblog',await api('/deployments/'+encodeURIComponent(document.getElementById('job').value)))}catch(e){show('joblog',e.message)}}
+async function job(){try{showJob(await api('/deployments/'+encodeURIComponent(document.getElementById('job').value)))}catch(e){show('joblog',e.message)}}
 
 async function instanceOperation(instance,action){
+ if(action==='changeip'){await openIPChange(instance);return}
  const message=document.getElementById('msg');
  const suffix='?account_id='+encodeURIComponent(instance.account_id);
  try{
@@ -415,7 +807,7 @@ async function createInstance(){
  try{
   const created=await api('/instances',{method:'POST',body:JSON.stringify({label,region:region.value,type:type.value,image:image.value,root_pass:password.value,confirm:true,open_all_ports:document.getElementById('openallports').checked})});
   message.textContent='创建成功，实例 ID：'+created.id+'，状态：'+created.status+'。'+(created.password_saved?'Root 密码已加密保存。':created.warning||'Root 密码未保存，请保管原密码。')+' 请刷新查看 IP 和启动进度。';
-  await load();
+  await load();if(created.boot_job_id){document.getElementById('job').value=created.boot_job_id;watchJob(created.boot_job_id)}
  }catch(e){message.textContent=e.message}
  finally{password.value='';button.disabled=false;account.disabled=false}
 }
@@ -448,7 +840,7 @@ async function saveProxy(){const input=document.getElementById('proxyurl');try{i
 async function removeProxy(){try{await api('/linode/proxy',{method:'DELETE'});document.getElementById('useproxy').checked=false;await proxyStatus()}catch(e){document.getElementById('proxystatus').textContent=e.message}}
 
 let watchedJob='';
-async function watchJob(id){watchedJob=id;const button=document.getElementById('installbutton');button.disabled=true;try{while(watchedJob===id){const result=await api('/deployments/'+encodeURIComponent(id));show('joblog',result);if(result.status==='success'||result.status==='failed'){if(result.status==='success')button.textContent='重新安装（会重启后端）';break;}await new Promise(resolve=>setTimeout(resolve,2500))}}catch(e){show('joblog',e.message)}finally{if(watchedJob===id){watchedJob='';button.disabled=false}}}
+async function watchJob(id){watchedJob=id;const button=document.getElementById('installbutton');button.disabled=true;try{while(watchedJob===id){const result=await api('/deployments/'+encodeURIComponent(id));showJob(result);if(['success','failed','partial','interrupted'].includes(result.status)){if(result.status==='success'&&!result.kind)button.textContent='重新安装（会重启后端）';break;}await new Promise(resolve=>setTimeout(resolve,2500))}}catch(e){show('joblog',e.message)}finally{if(watchedJob===id){watchedJob='';button.disabled=false}}}
 
 let nodeCache=[],nodePage=0;
 function renderNodes(){
@@ -472,4 +864,11 @@ function updateDNSTarget(){const instance=installationTargets.find(x=>String(x.i
 async function discoverDNS(){const button=document.getElementById('dnsdiscover'),message=document.getElementById('dnsmsg');if(button.disabled)return;button.disabled=true;message.textContent='正在读取托管域名并匹配当前 wp2 节点…';try{const result=await api('/dns/discover',{method:'POST',body:JSON.stringify({provider:document.getElementById('dnsprovider').value,token:document.getElementById('dnstoken').value,access_key_id:document.getElementById('dnsaccessid').value,access_key_secret:document.getElementById('dnssecret').value,node_id:Number(document.getElementById('node').value)||0})});const select=document.getElementById('dnszones');select.replaceChildren();const empty=document.createElement('option');empty.value='';empty.textContent='选择托管域名';select.appendChild(empty);for(const zone of result.zones){const option=document.createElement('option');option.value=zone;option.textContent=zone;select.appendChild(option)}select.value=result.suggested_zone||'';document.getElementById('dnszone').value=result.suggested_zone||'';message.textContent=result.message||'读取到 '+result.zones.length+' 个托管域名。'+(result.suggested_zone?'已自动选择 '+result.suggested_zone+'，保存后安装时解析到所选实例 IP。':'请选择正确域名后保存。')}catch(e){message.textContent=e.message}finally{button.disabled=false}}
 
 async function backendLogs(){const account=document.getElementById('account').value,id=Number(document.getElementById('instance').value),button=document.getElementById('backendlogbutton');if(!account||!Number.isInteger(id)||id<=0){show('joblog','请先选择具体账号和服务器');return}if(button.disabled)return;button.disabled=true;try{const result=await api('/instances/'+id+'/backend/logs');document.getElementById('joblog').textContent='后端服务状态：'+result.service+'\n'+result.log}catch(e){show('joblog',e.message)}finally{button.disabled=false}}
+
+let ipChangeTarget=null,ipChangePlans=[],lastIPJob=null;
+function showJob(result){show('joblog',result);if(result.kind==='ip_change'){lastIPJob=result;document.getElementById('ipcleanup').hidden=result.helper_cleaned||!['failed','interrupted'].includes(result.status)}else{document.getElementById('ipcleanup').hidden=true}}
+async function openIPChange(instance){try{const result=await api('/instances/'+instance.id+'/ip-change-plan?account_id='+encodeURIComponent(instance.account_id));ipChangeTarget=result.instance;ipChangePlans=result.plans;const select=document.getElementById('ipplan');select.replaceChildren();for(const plan of result.plans){const option=document.createElement('option');option.value=plan.id;option.textContent=plan.label+' · USD '+plan.price.hourly+'/小时（参考）';select.appendChild(option)}select.value=result.plans[0]?.id||'';const nodes=document.getElementById('ipnode');nodes.replaceChildren();const none=document.createElement('option');none.value='';none.textContent='不自动更新 DNS';nodes.appendChild(none);for(const node of nodeCache){const option=document.createElement('option');option.value=String(node.id);option.textContent=node.name+' (#'+node.id+')';nodes.appendChild(option)}nodes.value=result.bound_node_id?String(result.bound_node_id):(String(instance.id)===document.getElementById('instance').value?document.getElementById('node').value:'');document.getElementById('ipsummary').textContent='原机：'+instance.label+' (#'+instance.id+')\n当前 IP：'+(instance.ipv4||[]).join(', ')+'\n地区：'+instance.region;document.getElementById('ipbilling').checked=false;document.getElementById('iperror').textContent='';document.getElementById('ipchangedialog').showModal()}catch(e){document.getElementById('msg').textContent=e.message}}
+async function startIPChange(){const button=document.getElementById('ipconfirm'),message=document.getElementById('iperror');if(button.disabled)return;const plan=ipChangePlans.find(x=>x.id===document.getElementById('ipplan').value);if(!ipChangeTarget||!plan||!document.getElementById('ipbilling').checked){message.textContent='请选择套餐并确认费用及短暂关机';return}if(prompt('保留原机、通过收费临时实例更换 IPv4。请输入原机 ID '+ipChangeTarget.id+' 确认：')!==String(ipChangeTarget.id))return;button.disabled=true;try{const result=await api('/instances/'+ipChangeTarget.id+'/change-ip?account_id='+encodeURIComponent(ipChangeTarget.account_id),{method:'POST',body:JSON.stringify({plan:plan.id,expected_ip:ipChangeTarget.ipv4[0],confirm_instance_id:ipChangeTarget.id,confirm_billing:true,expected_hourly:plan.price.hourly,node_id:Number(document.getElementById('ipnode').value)||0})});document.getElementById('ipchangedialog').close();document.getElementById('job').value=result.job_id;watchJob(result.job_id);document.getElementById('deploy').scrollIntoView?.({behavior:'smooth'})}catch(e){message.textContent=e.message}finally{button.disabled=false}}
+async function cleanupIPChange(){if(!lastIPJob||!confirm('仅清理换 IP 任务创建的空临时实例，原机 #'+lastIPJob.instance_id+' 不会删除。确认继续？'))return;try{await api('/ip-changes/'+encodeURIComponent(lastIPJob.job_id)+'/cleanup',{method:'POST',body:JSON.stringify({confirm_instance_id:lastIPJob.instance_id})});showJob(await api('/deployments/'+encodeURIComponent(lastIPJob.job_id)));await loadIPChanges()}catch(e){show('joblog',e.message)}}
+async function loadIPChanges(){try{const result=await api('/ip-changes');const root=document.getElementById('ipchanges');root.replaceChildren();for(const item of result.jobs){const button=document.createElement('button');button.textContent='#'+item.instance_id+' · '+item.status+' · '+(item.new_ip||'待更换');button.onclick=()=>{document.getElementById('job').value=item.job_id;watchJob(item.job_id)};root.appendChild(button)}}catch(e){document.getElementById('ipchanges').textContent=e.message}}
 async function initialize(){await loadAccounts();await Promise.all([load(),nodes(),monitor(),wp2Connection(),proxyStatus(),loadDNS(),loadTelegram()])}initialize();setInterval(()=>monitor(),30000)</script></html>`

@@ -33,6 +33,7 @@ func (s *Server) deleteInstance(w http.ResponseWriter,r *http.Request){
  if account==""||err!=nil||id<=0{fail(w,400,"Select an account and valid instance");return}
  if r.URL.Query().Get("confirm_id")!=strconv.Itoa(id){fail(w,400,"Confirm the instance ID before permanent deletion");return}
  if _,err:=s.accountToken(account);err!=nil{fail(w,400,"Unknown account");return}
+ if s.instanceChangingIP(account,id){fail(w,409,"原机正在换 IP，请等待");return}
  _,status,err:=s.linodeFor(r.Context(),account,"DELETE","/linode/instances/"+strconv.Itoa(id),nil)
  if err!=nil{fail(w,502,"Deletion result unknown. Refresh the instance list before retrying.");return}
  if status!=200&&status!=204{fail(w,502,fmt.Sprintf("Linode delete HTTP %d; check permissions and instance state",status));return}

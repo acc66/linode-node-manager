@@ -87,7 +87,7 @@ TG_CHAT_ID=
 - `WP2_BASE_URL`：必须为 HTTPS，填写 wp2 API 根地址（不包含 `/mod_mu/nodes`）。
 - `WP2_API_TOKEN`：wp2 通信密钥。某些 wp2 设置还会按来源 IP 控制访问，请在 wp2 服务端确认。
 - `PANEL_DOMAIN`：写实际域名，不要写带协议的 URL；需要域名解析到当前管理服务器。
-- Telegram 未配置则暂不会发送告警。资源监控需要 SSH 密钥及各被监控节点的已验证主机密钥。
+- 资源监控默认每分钟运行；面板创建的实例使用加密保存的 Root 密码 SSH 探测，其他实例可配置 SSH 密钥和已核实的主机密钥。`MONITOR_ENABLED=false` 可关闭监控。
 
 生成强随机值的例子（输出只保存在你自己的终端，不要发到聊天、GitHub 或日志）：
 
@@ -182,7 +182,7 @@ curl --user admin https://panel.example.com/api/health
 
 ## 8. 开启监控和 Telegram 通知
 
-SSH 已验证正常后，在 `.env` 配置：
+监控默认开启，每 60 秒轮询。需要调整轮询间隔或配置 Telegram 通知时，在 `.env` 设置：
 
 ```dotenv
 MONITOR_ENABLED=true
@@ -218,7 +218,7 @@ docker compose --profile public logs --tail=100 manager
 | 登录返回 401 | 账号或密码不正确；登录失败不再触发次数锁定，确认浏览器没有缓存旧密码 |
 | Linode 列表错误 | 检查未过期的新 Linode Token、API 权限、管理机出站网络 |
 | wp2 节点空/502 | 检查 HTTPS API 根地址、通信密钥、wp2 接口限制与来源 IP 白名单 |
-| SSH 监控显示离线 | 检查密钥权限、known_hosts 指纹、SSH 连接与 Python 3 |
+| SSH 监控显示离线 | 面板创建的实例检查保存的 Root 密码；其他实例检查 SSH 密钥权限、known_hosts 指纹和 SSH 连接 |
 | 没有 Telegram 通知 | 检查 bot Token、chat ID，确认监控已启用且已满足告警触发条件 |
 
 日志检查：
@@ -261,7 +261,7 @@ docker compose --profile public down
 
 ## 12. 实例 IP、密码和删除
 
-列表显示 IPv4、IPv6、地区和套餐。创建后刷新列表查看启动与 IP 分配状态。通过本面板新建的实例自动加密保存 Root 密码，点击“查看密码”可查看；已有实例的密码无法从 Linode API 找回。删除实例需要输入实例 ID，成功后清除该账号对应的保存密码。删除永久移除云端实例及其磁盘。
+列表显示 IPv4、IPv6、地区和套餐。创建后刷新列表查看启动与 IP 分配状态。通过本面板新建的实例自动加密保存 Root 密码，点击“查看密码”可查看；已有实例的密码无法从 Linode API 找回。删除实例需要输入实例 ID，成功后清除该账号对应的保存密码。删除永久移除云端实例及其磁盘。更换 IPv4 会创建一个同区域、无磁盘且不开机的临时 Linode，使用 Linode Networking IP swap 替换原实例公网 IPv4，原实例系统盘与数据保留。提交前会展示临时实例价格，并要求费用确认与输入原实例 ID。此操作要求原实例具备 network helper，并且当前 IP 可参与 swap。swap 确认后才会回收临时实例；状态不明时保留临时实例并在任务详情提示手工处理。已配置的节点 DNS 会更新 A/AAAA；DNS 更新错误显示服务商返回码，IP 更换不会回滚。临时资源计费以 Linode 控制面板为准。
 
 wp2 返回空列表时运行只读诊断：`docker compose exec -T manager python3 < wp2-check.py`，输出只包含 HTTP 状态、认证结果、数据结构及节点 ID，不输出密钥或完整配置。管理机当前 muKey 与 wp2 应保持一致；来源 IP 限制需要在 wp2 端检查。
 
@@ -333,4 +333,4 @@ DNS 设置区会显示当前选择的 Linode 实例公网 IP。A 记录指向该
 
 安装期间进度自动刷新，完成或失败时附上 systemd 状态和后端 journal 日志。也可选择服务器后点击“查看后端日志”，只读取日志，不执行重装。日志对面板 Token 和 SSH 密码进行脱敏。首次 SSH 的 known_hosts 提示不会导致日志 JSON 解析失败。
 
-运行中的重复安装会被拦截；安装完成后再次确认会重新部署并重启服务，可能短暂中断。保留原实例更换新 IPv4 的临时实例流程尚未实现，不会因点击安装而触发换 IP 或创建临时实例。
+运行中的重复安装会被拦截；安装完成后再次确认会重新部署并重启服务，可能短暂中断。安装、换 IP 和开机任务会记录后端步骤日志；换 IP 任务另显示新旧 IP 及临时实例清理状态。

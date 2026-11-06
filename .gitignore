@@ -7,6 +7,7 @@ __pycache__/
 secrets/
 *.pem
 *.key
+/linode-node-manager
 
 # Local environment backups
 .env*

@@ -65,5 +65,6 @@ func (s *Server) createInstance(w http.ResponseWriter,r *http.Request){
  warning:=""
  if err:=s.saveRootPassword(account,inst.ID,inst.Label,in.RootPass);err!=nil{warning="Instance created, but saving its password failed. Keep the password you entered; do not create again."}else{inst.PasswordSaved=true}
  if openAll{if err:=s.saveRootPassword("open-ports-"+account,inst.ID,inst.Label,"true");err!=nil{warning+=" 服务器已创建并且云防火墙不绑定，但全端口配置状态未保存。"}}
- send(w,201,struct{Instance;Warning string `json:"warning,omitempty"`}{inst,warning})
+ enabled,_:=r.Context().Value(proxyContextKey{}).(bool);bootJob:="";if inst.PasswordSaved{bootJob=s.queueBootTuning(account,inst.ID,enabled)}
+ send(w,201,struct{Instance;Warning string `json:"warning,omitempty"`;BootJob string `json:"boot_job_id,omitempty"`}{inst,warning,bootJob})
 }

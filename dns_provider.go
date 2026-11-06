@@ -238,12 +238,67 @@ func (s *Server) dnsHTTP(ctx context.Context, method, target string, headers map
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("DNS API HTTP %d，请检查域名和 Key 权限", resp.StatusCode)
+		// Keep upstream error details (especially AliDNS's machine-readable Code)
+		// so a bad parameter can be distinguished from an expired key. Never echo
+		// the request URL/body, which may contain credentials or signatures.
+		var detail struct {
+			Code    string `json:"Code"`
+			Message string `json:"Message"`
+			Error   string `json:"error"`
+		}
+		_ = json.NewDecoder(io.LimitReader(resp.Body, 16<<10)).Decode(&detail)
+		code := detail.Code
+		if code == "" {
+			code = detail.Error
+		}
+		code = safeDNSError(code, 100)
+		message := safeDNSError(detail.Message, 180)
+		if code != "" && message != "" {
+			return fmt.Errorf("DNS API HTTP %d (%s): %s", resp.StatusCode, code, message)
+		}
+		if code != "" {
+			return fmt.Errorf("DNS API HTTP %d (%s)", resp.StatusCode, code)
+		}
+		return fmt.Errorf("DNS API HTTP %d，请检查域名、请求参数与 Key 权限", resp.StatusCode)
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 4<<20)).Decode(result); err != nil {
 		return errors.New("DNS API 响应格式无效")
 	}
 	return nil
+}
+
+func safeDNSError(value string, limit int) string {
+	value = strings.Map(func(r rune) rune {
+		if r < 32 || r == 127 {
+			return ' '
+		}
+		return r
+	}, value)
+	// Do not let a provider echo an access key, token, or request signature into
+	// the dashboard/job log.
+	for _, marker := range []string{"AccessKeySecret", "AccessKeyId", "Signature", "Token", "Secret"} {
+		for start := 0; ; {
+			i := strings.Index(strings.ToLower(value[start:]), strings.ToLower(marker))
+			if i < 0 {
+				break
+			}
+			i += start
+			end := strings.IndexAny(value[i:], " ,;\"'&")
+			if end < 0 {
+				end = len(value) - i
+			}
+			value = value[:i] + marker + "=[redacted]" + value[i+end:]
+			start = i + len(marker) + len("=[redacted]")
+			if start >= len(value) {
+				break
+			}
+		}
+	}
+	value = strings.TrimSpace(value)
+	if len(value) > limit {
+		value = value[:limit]
+	}
+	return value
 }
 func (s *Server) cfRequest(ctx context.Context, config DNSConfig, method, path string, payload any, result any) error {
 	var body io.Reader
@@ -322,13 +377,19 @@ func (s *Server) aliRequest(ctx context.Context, config DNSConfig, action string
 		return err
 	}
 	var status struct {
-		Code string `json:"Code"`
+		Code    string `json:"Code"`
+		Message string `json:"Message"`
 	}
 	if json.Unmarshal(raw, &status) != nil {
 		return errors.New("阿里云 DNS 响应格式无效")
 	}
 	if status.Code != "" {
-		return errors.New("阿里云 DNS 拒绝请求，请检查域名和 RAM DNS 读写权限")
+		code := safeDNSError(status.Code, 100)
+		message := safeDNSError(status.Message, 180)
+		if message != "" {
+			return fmt.Errorf("阿里云 DNS 拒绝请求 (%s): %s", code, message)
+		}
+		return fmt.Errorf("阿里云 DNS 拒绝请求 (%s)，请检查域名和 RAM DNS 读写权限", code)
 	}
 	if result != nil {
 		if json.Unmarshal(raw, result) != nil {

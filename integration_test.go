@@ -184,6 +184,9 @@ func TestMockInstallTaskAndRedaction(t *testing.T) {
 		if !strings.Contains(script, "XN_AUTODEPLOY") || !strings.Contains(script, "CertMagic") || !strings.Contains(script, "sha256") {
 			t.Fatalf("automatic deployment script malformed")
 		}
+		if strings.Contains(script, "tcp_congestion_control=bbr") || strings.Contains(script, "NOFILE_CONFIGURED") || strings.Contains(script, "ufw insert 1") {
+			t.Fatal("backend install must not repeat boot-time system tuning")
+		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("mock SSH runner not invoked")
 	}

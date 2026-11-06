@@ -422,10 +422,6 @@ WantedBy=multi-user.target
         if shutil.which('ufw'):
             status = command('ufw', 'status', check=False).stdout
             if 'Status: active' in status:
-                if payload.get('open_all_ports', False):
-                    command('ufw', 'insert', '1', 'allow', 'in', 'from', 'any', 'to', 'any')
-                    command('ufw', 'insert', '1', 'allow', 'out', 'from', 'any', 'to', 'any')
-                    print('已按创建设置放行本机 UFW 全部入站/出站端口。', flush=True)
                 for item in prepared:
                     transport = 'udp' if item['protocol'] in ['hysteria', 'hysteria2', 'tuic'] else 'tcp'
                     command('ufw', 'allow', '%d/%s' % (item['port'], transport))

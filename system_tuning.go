@@ -37,6 +37,30 @@ esac
 echo 'NOFILE_CONFIGURED: root/* 登录会话 soft/hard 65535，配置已持久保存。'
 `
 
+func bootInitializationScript(openAllPorts bool) string {
+	script := systemTuningScript
+	if openAllPorts {
+		script += `
+if command -v ufw >/dev/null 2>&1; then
+ status=$(ufw status 2>/dev/null || true)
+ case "$status" in
+  *"Status: active"*)
+   rules=$(ufw status numbered 2>/dev/null || true)
+   printf '%s\n' "$rules" | grep -Eq 'ALLOW IN +Anywhere' || ufw insert 1 allow in from any to any
+   rules=$(ufw status numbered 2>/dev/null || true)
+   printf '%s\n' "$rules" | grep -Eq 'ALLOW OUT +Anywhere' || ufw insert 1 allow out from any to any
+   echo 'UFW_ALL_PORTS_ENABLED: active firewall allows all inbound and outbound traffic.'
+   ;;
+  *) echo 'UFW_INACTIVE: no local firewall rules required.' ;;
+ esac
+else
+ echo 'UFW_NOT_INSTALLED: Linode cloud firewall configuration remains in effect.'
+fi
+`
+	}
+	return script
+}
+
 func (s *Server) canTune(account string, id int) bool {
 	if s.passwordSaved(account, id) {
 		return true
@@ -45,11 +69,11 @@ func (s *Server) canTune(account string, id int) bool {
 	_, knownErr := os.Stat(env("SSH_KNOWN_HOSTS_PATH", "/run/secrets/known_hosts"))
 	return keyErr == nil && knownErr == nil
 }
-func (s *Server) tuneNode(ctx context.Context, account string, instance Instance) (string, error) {
+func (s *Server) tuneNode(ctx context.Context, account string, instance Instance, openAllPorts bool) (string, error) {
 	var output string
 	var err error
 	for attempt := 0; attempt < 20; attempt++ {
-		output, err = s.deploySSH(ctx, account, instance, systemTuningScript)
+		output, err = s.deploySSH(ctx, account, instance, bootInitializationScript(openAllPorts))
 		if err == nil {
 			return output, nil
 		}
@@ -84,7 +108,7 @@ func (s *Server) queueBootTuning(account string, id int, useProxy bool) string {
 		instance, err := s.waitIPInstance(ctx, account, id, func(i Instance) bool { return i.Status == "running" && publicIP(i) != "" })
 		output := ""
 		if err == nil {
-			output, err = s.tuneNode(ctx, account, instance)
+			output, err = s.tuneNode(ctx, account, instance, s.openPortsSaved(account, id))
 		}
 		job.Log += output
 		job.Status = "success"

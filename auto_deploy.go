@@ -16,8 +16,8 @@ import (
 //go:embed deploy_node.py
 var deployPython string
 
-func deploymentScript(base, token string, nodeIDs []int, instance Instance, dnsReady bool, connectionDomains map[int]string) string {
-	payload, _ := json.Marshal(map[string]any{"panel": base, "token": token, "node_ids": nodeIDs, "ip": publicIP(instance), "ipv6": instance.IPv6, "open_all_ports": instance.OpenAllPorts, "connection_domains": connectionDomains, "dns_wait": dnsReady})
+func deploymentScript(base, token string, nodeIDs []int, instance Instance, dnsReady bool, connectionDomains map[int]string, operation string) string {
+	payload, _ := json.Marshal(map[string]any{"panel": base, "token": token, "node_ids": nodeIDs, "operation": operation, "ip": publicIP(instance), "ipv6": instance.IPv6, "open_all_ports": instance.OpenAllPorts, "connection_domains": connectionDomains, "dns_wait": dnsReady})
 	return "set -e\n" + systemTuningScript + "\nexport DEBIAN_FRONTEND=noninteractive\nif ! command -v python3 >/dev/null || ! command -v openssl >/dev/null; then\n if command -v apt-get >/dev/null; then apt-get update -qq && apt-get install -y -qq python3 ca-certificates openssl; else echo '自动部署当前要求 Debian/Ubuntu，或预装 python3/openssl'; exit 1; fi\nfi\npython3 - <<'XN_AUTODEPLOY'\n" + deployPython + "\nimport base64\npayload=json.loads(base64.b64decode(" + strconv.Quote(base64.StdEncoding.EncodeToString(payload)) + "))\ntry:\n    deploy(payload)\nexcept Exception as error:\n    message=str(error).replace(payload['token'],'[REDACTED]')\n    print('部署失败：'+message,flush=True)\n    raise SystemExit(1)\nXN_AUTODEPLOY\n"
 }
 func (s *Server) deploySSH(ctx context.Context, account string, instance Instance, script string, progress ...func(string)) (string, error) {

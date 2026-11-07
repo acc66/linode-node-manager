@@ -3,7 +3,7 @@
     header {
         Strict-Transport-Security "max-age=31536000; includeSubDomains"
         X-Content-Type-Options "nosniff"
-        Referrer-Policy "no-referrer"
+        Referrer-Policy "same-origin"
     }
     reverse_proxy manager:8000
 }

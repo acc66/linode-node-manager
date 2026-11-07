@@ -110,3 +110,32 @@ TLS 域名从 wp2 节点配置获取。域名的 A/AAAA 必须指向实例，公
 页面提供每个账号的“测试 API”和最近检查结果，手动测试不会推进自动失败计数。接口沿用管理员认证：`POST /api/accounts/{id}/api-check`、`GET/PUT /api/refill`、`POST /api/refill/{run,resume,pause,probe,boot,change-ip}`、`GET/PUT /api/account-pool`、`POST /api/accounts/{id}/egress`。付费动作要求 `{"confirm_billing":true}`。
 
 检查命令：`go test -race ./...`、`go vet ./...`、`node tests/dashboard.test.cjs`、`node tests/refill.test.cjs`。自动化测试不创建真实收费资源；真实 Linode 配额申请、SSH、DNS 接替及国内网络仍需按实际配置联调。
+
+### 多任务与任务查询
+
+`/refill` 顶部提供任务列表。新建任务立即返回独立 `task_id`，默认是停用的草稿，不会马上创建云服务器。选择任务后，可以分别配置账号队列、当前实例、脚本和接替域名，并查看进度、实例 ID、新 IP、换 IP 次数及最近 200 条日志。列表仅返回摘要，不包含脚本或 Root 密码；详情不会回显待建实例的 Root 密码。
+
+```text
+POST   /api/refill/tasks                     新建任务（例如 {"name":"日本节点补机"}）
+GET    /api/refill/tasks                     查询全部任务摘要
+GET    /api/refill/tasks/{task_id}           查询指定任务、阶段及日志
+PUT    /api/refill/tasks/{task_id}           保存任务名称、config、current_account、current_instance
+POST   /api/refill/tasks/{task_id}/run       排队执行一次检查 / 接替
+POST   /api/refill/tasks/{task_id}/pause     独立暂停或安全停止
+POST   /api/refill/tasks/{task_id}/resume    核对后恢复未完成实例
+POST   /api/refill/tasks/{task_id}/probe     国内检测
+POST   /api/refill/tasks/{task_id}/boot      开机、IP 检查及脚本
+POST   /api/refill/tasks/{task_id}/change-ip 原机换 IP
+DELETE /api/refill/tasks/{task_id}           仅删除已停用且未占用云资源的任务
+```
+
+新建返回 HTTP 201，例如 `{"task_id":"…","status":"draft","status_url":"/api/refill/tasks/…"}`。运行操作返回 HTTP 202 和相同的查询地址；付费操作仍要求 `{"confirm_billing":true}`。同一任务不能重复排队，未知任务返回 404。`GET/PUT /api/refill` 和原有操作接口保留，作为 `default` 默认任务的兼容入口。
+
+- 最多保存 100 个任务（含默认任务）。每个任务独立持久保存配置、阶段、队列动作、API 失败计数及日志；旧版全局记录自动作为默认任务读取。
+- 每个任务独立监控，最多并发检查 6 个。建机、部署、开关机和换 IP 等实例运维按队列串行执行；某任务持续换 IP 不会阻止其他任务的 API 监控。
+- 换 IP 每轮结束后，先确认回滚或新地址状态，再持久记录下一轮并让出执行位置，至少等待 15 秒后重新排队，没有次数上限。其他已排队任务可以先执行。
+- 同一账号只能被一个任务领取。候选账号可出现在多个队列中，但领取前会检查占用，保存创建意图时再次原子校验；当前、待建和历史实例使用过的账号不会自动交给另一任务重复使用。同一接替域名也不能重复配置。
+- 单独暂停只影响目标任务。已发出的云请求保留意图供核对；管理程序重启发现进行中的建机、脚本或换 IP，会暂停对应任务，不重放创建。尚未开始的排队操作可以继续排队。
+- 脚本额外提供 `LNM_TASK_ID` 环境变量。只有从未占用云资源、未排队且已停用的任务可以删除；默认任务不允许删除。删除任务不会调用云服务器删除接口。
+
+测试包含任务 ID 查询、密码隐藏、加密恢复、原子账号领取、域名冲突、独立暂停、监控不受付费队列阻塞、付费操作 FIFO 串行及换 IP 重试让出执行位置。

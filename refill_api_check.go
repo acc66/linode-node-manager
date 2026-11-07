@@ -194,12 +194,17 @@ func (s *Server) accountAPICheckAPI(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "账号不存在或未配置")
 		return
 	}
-	if !s.refillMu.TryLock() {
+	taskID := r.URL.Query().Get("task_id")
+	if taskID == "" {
+		taskID = defaultRefillTask
+	}
+	rt := s.refillRuntime(taskID)
+	if !rt.mu.TryLock() {
 		fail(w, 409, "运维任务正在运行，请等待后测试")
 		return
 	}
-	defer s.refillMu.Unlock()
-	st, err := s.loadRefill()
+	defer rt.mu.Unlock()
+	st, err := s.loadRefillTask(taskID)
 	if err != nil {
 		fail(w, 503, err.Error())
 		return

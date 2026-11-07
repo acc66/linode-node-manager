@@ -27,9 +27,6 @@ func (s *Server) ensureRefillIP(ctx context.Context, st *RefillState, account st
 		if err := s.saveRefill(st, fmt.Sprintf("国内 IP 检查未通过，进行第 %d 轮原机换 IP；不设次数上限，可暂停", st.IPAttempts)); err != nil {
 			return instance, err
 		}
-		if err := s.refillDelay(ctx, 15*time.Second); err != nil {
-			return instance, err
-		}
 		var next Instance
 		var op *IPChange
 		if s.refillReplaceIP != nil {
@@ -47,7 +44,7 @@ func (s *Server) ensureRefillIP(ctx context.Context, st *RefillState, account st
 				return instance, err
 			}
 			instance = checked
-			continue
+			return instance, s.yieldRefillIP(st)
 		}
 		if !errors.Is(err, errDomesticTCPUnreachable) {
 			return instance, err
@@ -65,5 +62,20 @@ func (s *Server) ensureRefillIP(ctx context.Context, st *RefillState, account st
 		if err := s.saveRefill(st, "候选 IP 国内不可达，已核实恢复旧地址；稍后继续申请下一 IP"); err != nil {
 			return instance, err
 		}
+		return instance, s.yieldRefillIP(st)
 	}
+}
+
+func (s *Server) yieldRefillIP(st *RefillState) error {
+	st.Stage = "ip_retry"
+	st.QueuedAction = "continue"
+	if st.Pending == nil {
+		st.QueuedAction = "boot"
+	}
+	st.QueuedAt = time.Now().UTC()
+	st.NextRunAt = st.QueuedAt.Add(15 * time.Second)
+	if err := s.saveRefill(st, "本轮换 IP 已结束，15 秒后再试；释放执行位置供其他任务使用"); err != nil {
+		return err
+	}
+	return errRefillYield
 }

@@ -265,10 +265,13 @@ func TestRefillAuthValidationAndConflict(t *testing.T) {
 	if w = apiRequest(h, "POST", "/api/refill/run", `{}`); w.Code != 400 {
 		t.Fatal("billing confirmation missing")
 	}
-	s.refillMu.Lock()
+	rt := s.refillRuntime(defaultRefillTask)
+	rt.mu.Lock()
 	if w = apiRequest(h, "POST", "/api/refill/run", `{"confirm_billing":true}`); w.Code != 409 {
 		t.Fatal("concurrent run accepted")
 	}
+	rt.mu.Unlock()
+	s.refillMu.Lock()
 	if w = apiRequest(h, "DELETE", "/api/accounts/"+ids[0], "{}"); w.Code != 409 {
 		t.Fatal("account deleted during refill")
 	}
@@ -565,7 +568,13 @@ func TestRefillUnlimitedIPRetriesUntilDomesticCheckPasses(t *testing.T) {
 		}
 		return instance, &IPChange{}, nil
 	}
-	_, err := s.ensureRefillIP(refillContext(context.Background()), &st, ids[1], instance, 22)
+	var err error
+	for round := 0; round < 6; round++ {
+		_, err = s.ensureRefillIP(refillContext(context.Background()), &st, ids[1], instance, 22)
+		if !errors.Is(err, errRefillYield) {
+			break
+		}
+	}
 	if err != nil || attempts != 5 || st.IPAttempts != 5 {
 		t.Fatal("IP retry capped or failed", attempts, err)
 	}
@@ -588,12 +597,13 @@ func TestRefillIPRetryStopsOnUnknownOutcomeAndCanBePaused(t *testing.T) {
 		t.Fatal("unknown IP allocation retried", err, calls)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	s.mu.Lock()
-	s.refillCancel = cancel
-	s.mu.Unlock()
-	s.refillMu.Lock()
+	rt := s.refillRuntime(defaultRefillTask)
+	s.refillTasksMu.Lock()
+	rt.cancel = cancel
+	s.refillTasksMu.Unlock()
+	rt.mu.Lock()
 	response := apiRequest(newHandler(s), "POST", "/api/refill/pause", `{}`)
-	s.refillMu.Unlock()
+	rt.mu.Unlock()
 	if response.Code != 202 || ctx.Err() == nil {
 		t.Fatal("running workflow cannot be stopped", response.Code)
 	}

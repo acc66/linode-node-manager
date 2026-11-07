@@ -54,6 +54,14 @@ type RefillRetired struct {
 	ShutdownRequested bool   `json:"shutdown_requested"`
 }
 type RefillState struct {
+	TaskID         string                    `json:"task_id"`
+	Name           string                    `json:"name"`
+	CreatedAt      time.Time                 `json:"created_at"`
+	UpdatedAt      time.Time                 `json:"updated_at"`
+	QueuedAction   string                    `json:"queued_action,omitempty"`
+	QueuedAt       time.Time                 `json:"queued_at"`
+	NextRunAt      time.Time                 `json:"next_run_at"`
+	Operation      string                    `json:"operation,omitempty"`
 	APIChecks      map[string]RefillAPICheck `json:"api_checks"`
 	APIFailures    int                       `json:"api_failures"`
 	LastAPIFailure time.Time                 `json:"last_api_failure"`
@@ -75,31 +83,27 @@ type RefillState struct {
 func defaultRefillConfig() RefillConfig {
 	return RefillConfig{Trigger: "api", Label: "refill-node", Image: "linode/debian12", CreditFloor: 0, IntervalMinutes: 1, BootCheck: true, AutoIP: true, CheckPort: 22, HealthPort: 22, OldPolicy: "keep"}
 }
-func (s *Server) loadRefill() (RefillState, error) {
-	st := RefillState{Config: defaultRefillConfig(), Stage: "idle", History: []RefillEvent{}}
-	if s.credentials == nil {
-		return st, errors.New("请配置 ACCOUNT_ENCRYPTION_KEY 启用加密存储")
-	}
-	raw, ok := s.credentials.token("refill-state/0")
-	if !ok {
-		return st, nil
-	}
-	st.Config.Trigger = "" // Detect legacy records without an explicit trigger.
-	if json.Unmarshal([]byte(raw), &st) != nil {
-		return st, errors.New("补号记录损坏，已停止自动操作")
-	}
-	if st.Config.Trigger != "api" {
-		st.Config.CreditFloor = 0
-	}
-	st.Config.Trigger = "api"
-	st.Config.ReserveGB = 0
-	st.Config.StopPercent = 0
-	st.Config.TransferPercent = 0
-	return st, nil
-}
+func (s *Server) loadRefill() (RefillState, error) { return s.loadRefillTask(defaultRefillTask) }
 func (s *Server) saveRefill(st *RefillState, message string) error {
+	if s.credentials == nil {
+		return errors.New("加密存储未配置")
+	}
+	if st.TaskID == "" {
+		st.TaskID = defaultRefillTask
+	}
+	if !validRefillTaskID(st.TaskID) {
+		return errors.New("任务 ID 无效")
+	}
+	now := time.Now().UTC()
+	if st.CreatedAt.IsZero() {
+		st.CreatedAt = now
+	}
+	st.UpdatedAt = now
+	if st.Name == "" {
+		st.Name = "默认任务"
+	}
 	if message != "" {
-		st.History = append(st.History, RefillEvent{At: time.Now().UTC().Format(time.RFC3339), Message: message})
+		st.History = append(st.History, RefillEvent{At: now.Format(time.RFC3339), Message: message})
 	}
 	if len(st.History) > 200 {
 		st.History = st.History[len(st.History)-200:]
@@ -108,7 +112,43 @@ func (s *Server) saveRefill(st *RefillState, message string) error {
 	if err != nil {
 		return err
 	}
-	return s.saveRootPassword("refill-state", 0, "Refill workflow", string(raw))
+	store := s.credentials
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err = checkRefillOwnersLocked(store, *st); err != nil {
+		return err
+	}
+
+	if st.TaskID != defaultRefillTask {
+		if _, exists := store.accounts[refillTaskKey(st.TaskID)]; !exists {
+			count := 0
+			hasDefault := false
+			for key := range store.accounts {
+				if id, ok := storedRefillTask(key); ok {
+					count++
+					hasDefault = hasDefault || id == defaultRefillTask
+				}
+			}
+			if !hasDefault {
+				count++
+			}
+			if count >= 100 {
+				return errors.New("最多保存 100 个补机任务")
+			}
+		}
+	}
+	key := refillTaskKey(st.TaskID)
+	old, exists := store.accounts[key]
+	store.accounts[key] = storedAccount{ID: key, Name: st.Name, Token: string(raw)}
+	if err = store.saveLocked(); err != nil {
+		if exists {
+			store.accounts[key] = old
+		} else {
+			delete(store.accounts, key)
+		}
+		return err
+	}
+	return nil
 }
 func (s *Server) validateRefill(c *RefillConfig) error {
 	if len(c.Accounts) == 0 || len(c.Accounts) > 100 {
@@ -282,8 +322,23 @@ func (s *Server) runRefill(ctx context.Context, st *RefillState, resume bool) er
 			return nil
 		}
 	}
+	firstBusy := -1
 	for index := st.Cursor; index < len(st.Config.Accounts); index++ {
 		account := st.Config.Accounts[index]
+		available, ownerErr := s.accountAvailableForTask(st.TaskID, account)
+		if ownerErr != nil {
+			return ownerErr
+		}
+		if !available {
+			if firstBusy < 0 {
+				firstBusy = index
+			}
+			if err := s.saveRefill(st, "账号已被其他任务领取，跳过 "+account); err != nil {
+				return err
+			}
+			continue
+		}
+
 		check, err := s.candidateRefillAPI(ctx, account)
 		if err != nil {
 			return err
@@ -318,11 +373,23 @@ func (s *Server) runRefill(ctx context.Context, st *RefillState, resume bool) er
 			return err
 		}
 		password := "Aa9!" + base64.RawURLEncoding.EncodeToString(random)
+		st.IPAttempts = 0
 		st.Pending = &RefillPending{Account: account, Label: st.Config.Label + "-" + strconv.FormatInt(time.Now().UnixNano(), 36), Password: password}
 		st.Stage = "creating"
 		if err := s.saveRefill(st, "创建意图已加密保存；正在请求新实例"); err != nil {
+			if errors.Is(err, errRefillOwned) {
+				st.Pending = nil
+				if firstBusy < 0 {
+					firstBusy = index
+				}
+				if saveErr := s.saveRefill(st, "账号在预检后被其他任务领取，未发送建机请求"); saveErr != nil {
+					return saveErr
+				}
+				continue
+			}
 			return err
 		}
+
 		data := map[string]any{"label": st.Pending.Label, "region": st.Config.Region, "type": st.Config.Type, "image": st.Config.Image, "root_pass": password, "booted": true, "tags": []string{"lnm-refill"}}
 		payload, _ := json.Marshal(data)
 		body, status, err := s.linodeFor(ctx, account, "POST", "/linode/instances", bytes.NewReader(payload))
@@ -370,6 +437,11 @@ func (s *Server) runRefill(ctx context.Context, st *RefillState, resume bool) er
 			return err
 		}
 		return s.finishRefill(ctx, st)
+	}
+	if firstBusy >= 0 {
+		st.Cursor = firstBusy
+		st.Stage = "account_wait"
+		return s.saveRefill(st, "候选账号被其他任务占用，等待补充可用账号；未重复领取")
 	}
 	st.Config.Enabled = false
 	st.Stage = "exhausted"
@@ -447,7 +519,7 @@ func (s *Server) finishRefill(ctx context.Context, st *RefillState) error {
 	if err := s.saveRefill(st, "IP 检查完成，执行开机脚本（输出不写入操作日志，避免泄露脚本密钥）"); err != nil {
 		return err
 	}
-	if err := s.runRefillBootScript(ctx, p.Account, instance, st.Config.Script); err != nil {
+	if err := s.runRefillBootScript(ctx, p.Account, instance, "export LNM_TASK_ID="+shellQuote(st.TaskID)+"\n"+st.Config.Script); err != nil {
 		return err
 	}
 	st.Stage = "health"
@@ -488,7 +560,6 @@ func (s *Server) finishRefill(ctx context.Context, st *RefillState) error {
 	st.APIFailures = 0
 	st.LastAPIFailure = time.Time{}
 	st.CreditAlerted = false
-	st.IPAttempts = 0
 	st.Stage = "ready"
 	if err := s.saveRefill(st, "接替成功，新 IP="+publicIP(instance)+"；旧实例未删除"); err != nil {
 		return err
@@ -504,40 +575,6 @@ func (s *Server) finishRefill(ctx context.Context, st *RefillState) error {
 	return nil
 }
 
-func (s *Server) refillWorker(resume bool, action string) {
-	defer s.refillMu.Unlock()
-	ctx, cancel := context.WithCancel(context.Background())
-	s.mu.Lock()
-	s.refillCancel = cancel
-	requested := s.refillPauseRequested
-	s.refillPauseRequested = false
-	s.mu.Unlock()
-	defer func() { s.mu.Lock(); s.refillCancel = nil; s.mu.Unlock() }()
-	if requested {
-		cancel()
-	}
-	defer cancel()
-	st, err := s.loadRefill()
-	if err != nil {
-		return
-	}
-	if action != "" {
-		err = s.refillInstanceAction(refillContext(ctx), &st, action)
-	} else {
-		err = s.runRefill(ctx, &st, resume)
-	}
-	if err != nil {
-		st.Config.Enabled = false
-		st.Stage = "failed"
-		if errors.Is(err, context.Canceled) {
-			st.Stage = "paused"
-		}
-		if saveErr := s.saveRefill(&st, err.Error()); saveErr != nil {
-			return
-		}
-		go s.telegram("Linode 自动运维已暂停：" + err.Error())
-	}
-}
 func (s *Server) refillInstanceAction(ctx context.Context, st *RefillState, action string) error {
 	if st.CurrentID <= 0 {
 		return errors.New("请先绑定或创建当前实例")
@@ -580,7 +617,7 @@ func (s *Server) refillInstanceAction(ctx context.Context, st *RefillState, acti
 		if err := s.saveRefill(st, "开机 IP 检查完成，执行开机脚本"); err != nil {
 			return err
 		}
-		if err := s.runRefillBootScript(ctx, st.CurrentAccount, instance, st.Config.Script); err != nil {
+		if err := s.runRefillBootScript(ctx, st.CurrentAccount, instance, "export LNM_TASK_ID="+shellQuote(st.TaskID)+"\n"+st.Config.Script); err != nil {
 			return err
 		}
 		instance, err = s.waitRefillPort(ctx, st.CurrentAccount, st.CurrentID, st.Config.HealthPort)
@@ -597,42 +634,18 @@ func (s *Server) refillInstanceAction(ctx context.Context, st *RefillState, acti
 	st.Stage = "ready"
 	return s.saveRefill(st, "实例操作完成："+action+" IP="+st.CurrentIP)
 }
-func (s *Server) refillScheduler(ctx context.Context) {
-	// A crash during a mutation must never silently replay a create or script.
-	if s.refillMu.TryLock() {
-		st, err := s.loadRefill()
-		if err == nil && st.Stage != "idle" && st.Stage != "ready" && st.Stage != "failed" && st.Stage != "exhausted" && st.Stage != "api_wait" && st.Stage != "paused" {
-			st.Config.Enabled = false
-			st.Stage = "interrupted"
-			_ = s.saveRefill(&st, "进程重启时发现未完成操作，已暂停；请核对后恢复")
-		}
-		s.refillMu.Unlock()
-	}
-	ticker := time.NewTicker(time.Minute)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			if !s.refillMu.TryLock() {
-				continue
-			}
-			st, err := s.loadRefill()
-			if err != nil || !st.Config.Enabled || st.Pending != nil || time.Since(st.LastCheck) < time.Duration(st.Config.IntervalMinutes)*time.Minute {
-				s.refillMu.Unlock()
-				continue
-			}
-			go s.refillWorker(false, "")
-		}
-	}
-}
 func (s *Server) registerRefill(mux *http.ServeMux) {
 	mux.HandleFunc("GET /refill", s.auth(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, refillPage)
 	}))
 	mux.HandleFunc("POST /api/accounts/{id}/api-check", s.auth(s.accountAPICheckAPI))
+	mux.HandleFunc("GET /api/refill/tasks", s.auth(s.refillTasksAPI))
+	mux.HandleFunc("POST /api/refill/tasks", s.auth(s.refillTasksAPI))
+	mux.HandleFunc("GET /api/refill/tasks/{task}", s.auth(s.refillTaskAPI))
+	mux.HandleFunc("PUT /api/refill/tasks/{task}", s.auth(s.refillTaskAPI))
+	mux.HandleFunc("DELETE /api/refill/tasks/{task}", s.auth(s.refillTaskAPI))
+	mux.HandleFunc("POST /api/refill/tasks/{task}/{action}", s.auth(s.refillTaskActionAPI))
 	mux.HandleFunc("GET /api/refill", s.auth(s.refillAPI))
 	mux.HandleFunc("PUT /api/refill", s.auth(s.refillAPI))
 	mux.HandleFunc("POST /api/refill/{action}", s.auth(s.refillAPI))
@@ -640,171 +653,12 @@ func (s *Server) registerRefill(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/accounts/{id}/transfer", s.auth(s.accountTransferAPI))
 }
 func (s *Server) refillAPI(w http.ResponseWriter, r *http.Request) {
-	if r.Method == "POST" && r.PathValue("action") == "pause" && !s.refillMu.TryLock() {
-		s.mu.Lock()
-		cancel := s.refillCancel
-		if cancel == nil {
-			s.refillPauseRequested = true
-		}
-		s.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-		send(w, 202, map[string]string{"status": "stopping", "message": "正在安全停止；已发送的请求将保留记录待核对"})
-		return
-	} else if r.Method == "POST" && r.PathValue("action") == "pause" {
-		s.refillMu.Unlock()
-	}
-
-	if r.Method == "GET" {
-		st, err := s.loadRefill()
-		if err != nil {
-			fail(w, 503, err.Error())
-			return
-		}
-		if st.Pending != nil {
-			st.Pending.Password = ""
-		}
-		busy := !s.refillMu.TryLock()
-		if !busy {
-			s.refillMu.Unlock()
-		}
-		send(w, 200, map[string]any{"state": st, "busy": busy})
-		return
-	}
-	if !s.refillMu.TryLock() {
-		fail(w, 409, "运维任务正在运行，请等待后再操作")
-		return
-	}
-	handedOff := false
-	defer func() {
-		if !handedOff {
-			s.refillMu.Unlock()
-		}
-	}()
-	st, err := s.loadRefill()
-	if err != nil {
-		fail(w, 503, err.Error())
-		return
-	}
-	if r.Method == "PUT" {
-		var in struct {
-			Config   RefillConfig `json:"config"`
-			Account  string       `json:"current_account"`
-			Instance int          `json:"current_instance"`
-		}
-		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64<<10))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&in) != nil || decoder.Decode(new(any)) != io.EOF {
-			fail(w, 400, "配置格式无效")
-			return
-		}
-		if st.Pending != nil {
-			fail(w, 409, "存在未完成建机，请先恢复并核对")
-			return
-		}
-		if err = s.validateRefill(&in.Config); err != nil {
-			fail(w, 400, err.Error())
-			return
-		}
-		if in.Instance < 0 {
-			fail(w, 400, "实例 ID 无效")
-			return
-		}
-		if in.Instance > 0 {
-			matched := false
-			for _, id := range in.Config.Accounts {
-				if id == in.Account {
-					matched = true
-				}
-			}
-			if !matched {
-				fail(w, 400, "当前账号不在队列中")
-				return
-			}
-			// Binding a current instance is read-only, but always uses its fixed proxy.
-			instance, lookupErr := s.ipInstance(refillContext(r.Context()), in.Account, in.Instance)
-			if lookupErr != nil {
-				fail(w, 400, "无法核实当前实例")
-				return
-			}
-			st.CurrentIP = publicIP(instance)
-		} else {
-			in.Account = ""
-			st.CurrentIP = ""
-		}
-		st.Config = in.Config
-		st.CurrentAccount = in.Account
-		st.CurrentCredit = nil
-		st.APIFailures = 0
-		st.LastAPIFailure = time.Time{}
-		st.CreditAlerted = false
-		st.CurrentID = in.Instance
-		st.Stage = "idle"
-		st.Cursor = 0
-		for i, id := range st.Config.Accounts {
-			if id == st.CurrentAccount && st.CurrentID > 0 {
-				st.Cursor = i + 1
-			}
-		}
-		err = s.saveRefill(&st, "配置已加密保存；自动补号="+strconv.FormatBool(st.Config.Enabled))
-		if err != nil {
-			fail(w, 500, "配置保存失败")
-			return
-		}
-		send(w, 200, map[string]bool{"saved": true})
-		return
-	}
-	action := r.PathValue("action")
-	if action == "pause" {
-		st.Config.Enabled = false
-		if err = s.saveRefill(&st, "已暂停自动补号"); err != nil {
-			fail(w, 500, "暂停保存失败")
-			return
-		}
-		send(w, 200, map[string]bool{"paused": true})
-		return
-	}
-	var confirm struct {
-		Billing bool `json:"confirm_billing"`
-	}
-	if json.NewDecoder(http.MaxBytesReader(w, r.Body, 1024)).Decode(&confirm) != nil {
-		fail(w, 400, "请求格式无效")
-		return
-	}
-	if action != "probe" && !confirm.Billing {
-		fail(w, 400, "请确认实例及 IPv4 的费用")
-		return
-	}
-	if action != "run" && action != "resume" && action != "probe" && action != "change-ip" && action != "boot" {
-		fail(w, 404, "未知操作")
-		return
-	}
-	if st.Pending != nil && action != "resume" {
-		fail(w, 409, "已有未完成建机记录，只能核对后恢复")
-		return
-	}
-	if action == "resume" && st.Pending == nil {
-		fail(w, 409, "没有未完成建机记录")
-		return
-	}
-	if action == "probe" || action == "change-ip" || action == "boot" {
-		if st.CurrentID <= 0 {
-			fail(w, 400, "请先绑定当前实例")
-			return
-		}
-		if !s.chinaProbeConfigured("aliyun") {
-			fail(w, 409, "请先配置阿里云国内探测机")
-			return
-		}
-	}
-	handedOff = true
-	if action == "run" || action == "resume" {
-		go s.refillWorker(action == "resume", "")
+	r.SetPathValue("task", defaultRefillTask)
+	if r.Method == "POST" {
+		s.refillTaskActionAPI(w, r)
 	} else {
-		go s.refillWorker(false, action)
+		s.refillTaskAPI(w, r)
 	}
-	send(w, 202, map[string]string{"status": "queued"})
 }
 func (s *Server) instanceTransferAPI(w http.ResponseWriter, r *http.Request) {
 	id, err := strconv.Atoi(r.PathValue("id"))

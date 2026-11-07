@@ -78,7 +78,23 @@ func sameBrowserOrigin(r *http.Request) bool {
 	}
 	if origin := r.Header.Get("Origin"); origin != "" {
 		u, err := url.Parse(origin)
-		return err == nil && u.Host == r.Host && (u.Scheme == "https" || u.Scheme == "http" && localBrowserHost(r.Host))
+		if err != nil || u.User != nil || u.Host == "" || u.Path != "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			return false
+		}
+		if u.Scheme == "http" {
+			return localBrowserHost(r.Host) && strings.EqualFold(u.Host, r.Host)
+		}
+		if u.Scheme != "https" {
+			return false
+		}
+		if strings.EqualFold(strings.TrimSuffix(u.Host, ":443"), strings.TrimSuffix(r.Host, ":443")) {
+			return true
+		}
+		// Reverse proxies may replace Host with their upstream address. Only
+		// trust the explicitly configured public domain, never forwarded headers.
+		public, err := url.Parse("https://" + strings.TrimSpace(os.Getenv("PANEL_DOMAIN")))
+		return err == nil && public.Host != "" && public.User == nil && public.Path == "" && public.RawQuery == "" && !public.ForceQuery && public.Fragment == "" &&
+			strings.EqualFold(strings.TrimSuffix(u.Host, ":443"), strings.TrimSuffix(public.Host, ":443"))
 	}
 	return true
 }
@@ -86,7 +102,7 @@ func sameBrowserOrigin(r *http.Request) bool {
 func browserSecurityHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'")
 }

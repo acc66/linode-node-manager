@@ -68,6 +68,8 @@ docker compose --profile public logs --tail=100 caddy manager
 
 登录页支持浏览器密码管理器保存账号密码；勾选“记住登录”后通过 HttpOnly Cookie 保持 30 天会话，密码不写入 localStorage。不勾选时使用最长 12 小时的浏览器会话。页面可退出登录，修改管理员密码会使旧会话失效。登录失败不会按次数锁定。若公网可访问，请额外优先启用 VPN / IP 白名单。
 
+如果 HTTPS 登录提示“登录来源无效”，检查反向代理是否保留原始 Host（Nginx 可设置 `proxy_set_header Host $http_host;`）。当代理必须改写 Host 时，在 manager 服务的 `.env` 中将 `PANEL_DOMAIN` 设为浏览器访问的实际域名（例如 `ld.seox9.com`，非标准 HTTPS 端口需一并填写），然后重建并重启 manager。登录和后续 API 会接受该配置域名的 HTTPS 来源；不会信任客户端提供的 `X-Forwarded-Host`。
+
 必填：浏览器登录使用 `ADMIN_USERNAME`、`ADMIN_PASSWORD`；自动化 API 使用 `ADMIN_TOKEN`；业务使用 `LINODE_TOKEN`、`WP2_BASE_URL`、`WP2_API_TOKEN`。wp2 源码已确认 `/mod_mu/nodes` 使用查询参数 `key`，且可能受 `WebAPI` 与 `checkNodeIp` 配置限制。已在聊天中公开的密钥请轮换，不要提交到 GitHub。
 
 可选：`MONITOR_ENABLED=true`、`MONITOR_INTERVAL=60`、`TG_BOT_TOKEN`、`TG_CHAT_ID`。

@@ -77,7 +77,21 @@ jobs:
           curl -ksS -u ci-operator:ci-test-password-long-enough https://localhost/api/health | grep -q '"status":"ok"'
           bad=$(curl -ksS -o /dev/null -w '%{http_code}' -u ci-operator:wrong-password https://localhost/api/health)
           test "$bad" = "401"
-          echo "Public HTTPS and browser password authentication passed"
+          login_cookie_file=$(mktemp)
+          login_status=$(curl -ksS -c "$login_cookie_file" -o /dev/null -w '%{http_code}' \
+            -H 'Origin: https://localhost' \
+            --data-urlencode 'username=ci-operator' \
+            --data-urlencode 'password=ci-test-password-long-enough' \
+            --data-urlencode 'remember=on' https://localhost/login)
+          test "$login_status" = "303"
+          curl -ksS -b "$login_cookie_file" https://localhost/api/health | grep -q '"status":"ok"'
+          curl -ksS -b "$login_cookie_file" -c "$login_cookie_file" \
+            -H 'Origin: https://localhost' -H 'Content-Type: application/json' \
+            -d '{}' https://localhost/api/logout | grep -q '"logged_out":true'
+          logged_out=$(curl -ksS -b "$login_cookie_file" -o /dev/null -w '%{http_code}' https://localhost/api/health)
+          test "$logged_out" = "401"
+          rm -f "$login_cookie_file"
+          echo "Public HTTPS, remembered form login, logout and API authentication passed"
       - name: Compile Linux amd64 and arm64 release bundles
         shell: bash
         run: |

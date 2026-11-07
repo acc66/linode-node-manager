@@ -269,8 +269,13 @@ func TestPoolBalanceUsesSelectedAccountProxyAndToken(t *testing.T) {
 	if err := s.saveProxyConfig(second.ID, "pool:selected"); err != nil {
 		t.Fatal(err)
 	}
-	w := apiRequest(newHandler(s), "GET", "/api/accounts/"+second.ID+"/billing?account_id="+first.ID+"&use_proxy=true", "")
-	if w.Code != 200 || !strings.Contains(w.Body.String(), `"balance":-12.5`) || strings.Contains(w.Body.String(), "private@example.com") {
-		t.Fatalf("selected proxy balance check failed: %d %s", w.Code, w.Body.String())
+	if err := s.saveRootPassword("linode-proxy-enabled-"+second.ID, 0, "disabled", "false"); err != nil {
+		t.Fatal(err)
+	}
+	for _, query := range []string{"", "?use_proxy=false", "?account_id=" + first.ID + "&use_proxy=true"} {
+		w := apiRequest(newHandler(s), "GET", "/api/accounts/"+second.ID+"/billing"+query, "")
+		if w.Code != 200 || !strings.Contains(w.Body.String(), `"balance":-12.5`) || strings.Contains(w.Body.String(), "private@example.com") {
+			t.Fatalf("selected proxy balance check failed: %d %s", w.Code, w.Body.String())
+		}
 	}
 }

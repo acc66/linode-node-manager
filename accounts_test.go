@@ -235,6 +235,27 @@ func TestLinodeAccountBillingIsScopedAndRedacted(t *testing.T) {
 	}
 }
 
+func TestAccountBalanceBrokenBindingCannotFallBackToDirect(t *testing.T) {
+	t.Setenv("ADMIN_TOKEN", "ci-admin")
+	t.Setenv("LINODE_TOKEN", "mock")
+	directCalls := 0
+	upstream := newMockUpstream(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		directCalls++
+		w.Write([]byte(`{"balance":1}`))
+	}))
+	defer upstream.Close()
+	t.Setenv("LINODE_API_BASE_URL", upstream.URL+"/v4")
+	s := testServer(upstream.Client())
+	dnsTestStore(t, s)
+	if err := s.saveRootPassword("linode-proxy-legacy", 0, "broken binding", "pool:missing"); err != nil {
+		t.Fatal(err)
+	}
+	w := apiRequest(newHandler(s), "GET", "/api/accounts/legacy/billing?use_proxy=false", "")
+	if w.Code != 502 || directCalls != 0 {
+		t.Fatalf("broken binding fell back to direct: status=%d calls=%d", w.Code, directCalls)
+	}
+}
+
 func TestAccountManagementHTTP(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "ci-admin")
 	t.Setenv("LINODE_TOKEN", "")

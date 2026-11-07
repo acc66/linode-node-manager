@@ -27,8 +27,9 @@ func TestPublicBrowserPasswordAuthentication(t *testing.T){
  basic:=func(u,p string)string{return "Basic "+base64.StdEncoding.EncodeToString([]byte(u+":"+p))}
  for _,p:=range []string{"/","/api/health","/api/instances","/api/wp2/nodes","/api/monitor","/api/deployments/unknown"}{
   w:=authRequest(h,"GET",p,"","","")
-  if w.Code!=401{t.Errorf("%s unauthenticated HTTP %d",p,w.Code)}
-  if p=="/"&&!strings.Contains(w.Header().Get("WWW-Authenticate"),"Basic"){t.Error("missing browser login challenge")}
+  want:=401;if p=="/"{want=302}
+  if w.Code!=want{t.Errorf("%s unauthenticated HTTP %d",p,w.Code)}
+  if p=="/"&&w.Header().Get("Location")!="/login"{t.Error("missing browser login redirect")}
  }
  if w:=authRequest(h,"GET","/api/health",basic("operator","very-strong-test-password"),"","");w.Code!=200{t.Fatalf("valid browser login HTTP %d %s",w.Code,w.Body.String())}
  if w:=authRequest(h,"GET","/",basic("operator","very-strong-test-password"),"","");w.Code!=200||!strings.Contains(w.Body.String(),"Linode 节点管理"){t.Fatalf("panel HTML inaccessible after login: %d",w.Code)}

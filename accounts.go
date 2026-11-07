@@ -305,10 +305,18 @@ func (s *Server) accountBilling(w http.ResponseWriter, r *http.Request) {
 		fail(w, 400, "请先选择 Linode 账号")
 		return
 	}
-	body, status, err := s.linodeFor(r.Context(), id, http.MethodGet, "/account", nil)
+	// Balance queries always follow the saved binding, independently of the
+	// operation toggle or caller-supplied use_proxy parameter. A broken binding
+	// must fail rather than silently send the account token directly.
+	bound := false
+	if s.credentials != nil {
+		_, bound = s.credentials.token("linode-proxy-" + id + "/0")
+	}
+	ctx := useProxyContext(r.Context(), bound)
+	body, status, err := s.linodeFor(ctx, id, http.MethodGet, "/account", nil)
 	if err != nil {
 		message := "Linode 直连查询失败：" + safeProxyFailure(err)
-		if enabled, _ := r.Context().Value(proxyContextKey{}).(bool); enabled {
+		if bound {
 			message = err.Error()
 		}
 		fail(w, 502, message)

@@ -110,6 +110,12 @@ func (s *Server) accountBulkAPI(w http.ResponseWriter, r *http.Request) {
 					fail(w, 409, fmt.Sprintf("账号 %s 正被补机任务 %s 占用，整批未删除", id, task.Name))
 					return
 				}
+				for _, queued := range task.Config.Accounts {
+					if queued == id {
+						fail(w, 409, fmt.Sprintf("账号 %s 仍在补机任务 %s 的账号队列中，整批未删除", id, task.Name))
+						return
+					}
+				}
 			}
 		}
 		for id := range unique {
@@ -174,6 +180,11 @@ func (s *Server) accountBulkBindingsAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	store := s.credentials
+	tasks, err := s.listRefillTasks()
+	if err != nil {
+		fail(w, 500, "无法核对补机任务账号占用，未修改绑定")
+		return
+	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	proxies, err := proxyPoolLocked(store)
@@ -195,6 +206,12 @@ func (s *Server) accountBulkBindingsAPI(w http.ResponseWriter, r *http.Request) 
 		if _, err := s.accountToken(binding.AccountID); err != nil {
 			fail(w, 400, "所选账号中有不存在的账号，未修改绑定")
 			return
+		}
+		for _, task := range tasks {
+			if refillClaimedAccounts(task)[binding.AccountID] {
+				fail(w, 409, fmt.Sprintf("账号 %s 正被补机任务 %s 使用，不能修改代理绑定", binding.AccountID, task.Name))
+				return
+			}
 		}
 		seenAccounts[binding.AccountID] = true
 		if binding.ProxyID == "" {

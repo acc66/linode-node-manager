@@ -205,9 +205,20 @@ func (s *Server) accountToken(id string) (string, error) {
 	return t, nil
 }
 func (s *Server) linodeFor(ctx context.Context, accountID, method, path string, payload io.Reader) ([]byte, int, error) {
+
+	strict, _ := ctx.Value(isolationContextKey{}).(bool)
+	if strict || s.isolationEnabled() {
+		if _, err := s.verifyAccountEgress(ctx, accountID); err != nil {
+			return nil, 503, err
+		}
+		ctx = useProxyContext(ctx, true)
+	}
 	token, err := s.accountToken(accountID)
 	if err != nil {
 		return nil, 503, err
+	}
+	if s.linodeHook != nil {
+		return s.linodeHook(ctx, accountID, method, path, payload)
 	}
 	base := env("LINODE_API_BASE_URL", "https://api.linode.com/v4")
 	if enabled, _ := ctx.Value(proxyContextKey{}).(bool); enabled {
@@ -356,6 +367,11 @@ func (s *Server) accountBilling(w http.ResponseWriter, r *http.Request) {
 	})
 }
 func (s *Server) deleteAccount(w http.ResponseWriter, r *http.Request) {
+	if !s.refillMu.TryRLock() {
+		fail(w, 409, "补号或账户运维正在运行，请等待")
+		return
+	}
+	defer s.refillMu.RUnlock()
 	if s.accounts == nil {
 		fail(w, 503, "Account storage unavailable")
 		return

@@ -157,6 +157,13 @@ func proxyClient(original *http.Client, raw string) (*http.Client, error) {
 	return &client, nil
 }
 func (s *Server) linodeProxyAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		if !s.refillMu.TryRLock() {
+			fail(w, 409, "补号任务正在运行，不能修改代理绑定")
+			return
+		}
+		defer s.refillMu.RUnlock()
+	}
 	account := r.URL.Query().Get("account_id")
 	if account == "" {
 		fail(w, 400, "请先选择具体 Linode 账号")

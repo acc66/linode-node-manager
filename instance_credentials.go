@@ -101,6 +101,11 @@ func (s *Server) saveInstancePassword(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) deleteInstance(w http.ResponseWriter, r *http.Request) {
+	if !s.refillMu.TryRLock() {
+		fail(w, 409, "补号或账户运维正在运行，请等待")
+		return
+	}
+	defer s.refillMu.RUnlock()
 	account := r.URL.Query().Get("account_id")
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if account == "" || err != nil || id <= 0 {

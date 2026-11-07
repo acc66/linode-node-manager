@@ -444,6 +444,11 @@ func (s *Server) ipChangePlanAPI(w http.ResponseWriter, r *http.Request) {
 	send(w, 200, map[string]any{"instance": instance, "bound_node_id": bound, "billing_notice": "直接给原机申请第二个公网 IPv4，额外 IP 可能按 Linode 价格收费；账号需要有额外 IPv4 配额。只有新 IP 通过连接验证后才释放旧 IP。"})
 }
 func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
+	if !s.refillMu.TryRLock() {
+		fail(w, 409, "补号或账户运维正在运行，请等待")
+		return
+	}
+	defer s.refillMu.RUnlock()
 	account := r.URL.Query().Get("account_id")
 	id, err := strconv.Atoi(r.PathValue("id"))
 	if account == "" || err != nil || id <= 0 {

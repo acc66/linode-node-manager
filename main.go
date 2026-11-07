@@ -21,6 +21,10 @@ import (
 )
 
 type Server struct {
+	linodeHook     func(context.Context, string, string, string, io.Reader) ([]byte, int, error)
+	refillWaitPort func(context.Context, string, int, int) (Instance, error)
+	refillMu       sync.RWMutex
+	egressLookup   func(context.Context, string) (string, error)
 	wp2Mu          sync.Mutex
 	client         *http.Client
 	mu             sync.RWMutex
@@ -562,6 +566,11 @@ func (s *Server) monitorRefreshAPI(w http.ResponseWriter, r *http.Request) {
 	send(w, 200, next)
 }
 func (s *Server) install(w http.ResponseWriter, r *http.Request) {
+	if !s.refillMu.TryRLock() {
+		fail(w, 409, "补号或账户运维正在运行，请等待")
+		return
+	}
+	defer s.refillMu.RUnlock()
 	accountID := r.URL.Query().Get("account_id")
 	if accountID == "" {
 		accountID = "legacy"
@@ -719,6 +728,10 @@ func (s *Server) install(w http.ResponseWriter, r *http.Request) {
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'" }
 func newHandler(s *Server) http.Handler {
 	mux := http.NewServeMux()
+	s.registerRefill(mux)
+	mux.HandleFunc("GET /api/account-pool", s.auth(s.accountPoolAPI))
+	mux.HandleFunc("PUT /api/account-pool", s.auth(s.accountPoolAPI))
+	mux.HandleFunc("POST /api/accounts/{id}/egress", s.auth(s.accountEgressAPI))
 	mux.HandleFunc("GET /login", s.browserLogin)
 	mux.HandleFunc("POST /login", s.browserLogin)
 	mux.HandleFunc("POST /api/logout", s.auth(s.browserLogout))
@@ -853,6 +866,11 @@ func newHandler(s *Server) http.Handler {
 		send(w, 200, v)
 	}))
 	mux.HandleFunc("POST /api/instances/{id}/{action}", s.auth(func(w http.ResponseWriter, r *http.Request) {
+		if !s.refillMu.TryRLock() {
+			fail(w, 409, "补号任务正在运行")
+			return
+		}
+		defer s.refillMu.RUnlock()
 		id, e := strconv.Atoi(r.PathValue("id"))
 		action := r.PathValue("action")
 		if e != nil || id <= 0 || (action != "boot" && action != "shutdown" && action != "reboot") {
@@ -904,6 +922,7 @@ func main() {
 	mux := newHandler(s)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	go s.refillScheduler(ctx)
 	// The dashboard's CPU/RAM/Disk cards depend on this poller. Start it by
 	// default; deployments can still opt out explicitly for constrained hosts.
 	if env("MONITOR_ENABLED", "true") != "false" {
@@ -941,7 +960,7 @@ const htmlPage = `<!doctype html>
 <header class="topbar"><div class="top-inner"><a class="brand" href="#overview"><span class="brand-mark">L</span><span><strong>Linode 节点管理</strong><small>CLOUD &amp; NODE CONSOLE</small></span></a><div class="toolbar"><span class="secure">● 已登录</span><button onclick="logout()">退出登录</button></div></div></header>
 <main class="shell">
 <div class="hero"><div><span class="eyebrow">YOUR CLOUD WORKSPACE</span><h1>服务器与节点，一处管理</h1><p>管理 Linode 实例、同步 wp2 节点，自动完成后端部署。</p></div><button onclick="load();monitor()">↻ 刷新</button></div>
-<nav class="navigation" aria-label="快捷导航"><a href="#overview">服务器</a><a href="#create">创建实例</a><a href="#wp2">wp2 节点</a><a href="#deploy">自动部署</a><a href="#dns">设置</a><a href="#chinaprobe">国内探测</a></nav>
+<nav class="navigation" aria-label="快捷导航"><a href="/refill">补号 / 账户池</a><a href="#overview">服务器</a><a href="#create">创建实例</a><a href="#wp2">wp2 节点</a><a href="#deploy">自动部署</a><a href="#dns">设置</a><a href="#chinaprobe">国内探测</a></nav>
 <section id="overview"><div class="section-header"><div><h2>Linode 账号</h2><p>先选择账号，再管理对应的服务器</p></div><span class="tag">多账号</span></div>
 <label>当前账号<select id="account" onchange="changeAccount()"><option value="">全部账号（仅查看）</option></select></label><p id="accountmsg" class="message"></p>
 <button onclick="openAccountManager()">管理账号</button><button onclick="openProxyPool()">代理池</button><label class="check"><input id="useproxy" type="checkbox" onchange="toggleProxy()">创建 / 开关机使用当前账号代理（不勾选直连）</label><p id="proxystatus" class="message"></p><div class="toolbar"><button id="billingbutton" onclick="queryAccountBilling()">查询余额 / 赠金</button><span class="hint">余额固定通过当前账号绑定的代理查询，未绑定时直连。</span></div><div id="billingcard" class="billing-grid"></div>

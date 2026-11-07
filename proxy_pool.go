@@ -63,6 +63,13 @@ func saveProxyPoolLocked(store *accountStore, entries []poolProxy) error {
 }
 
 func (s *Server) proxyPoolEntryAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		if !s.refillMu.TryRLock() {
+			fail(w, 409, "补号任务正在运行，不能修改代理绑定")
+			return
+		}
+		defer s.refillMu.RUnlock()
+	}
 	if s.credentials == nil {
 		fail(w, 503, "代理加密存储未配置")
 		return
@@ -144,6 +151,13 @@ func (s *Server) poolURL(id string) (string, bool) {
 	return "", false
 }
 func (s *Server) proxyPoolAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		if !s.refillMu.TryRLock() {
+			fail(w, 409, "补号任务正在运行，不能修改代理绑定")
+			return
+		}
+		defer s.refillMu.RUnlock()
+	}
 	if r.Method != http.MethodGet && r.Method != http.MethodPost && r.Method != http.MethodPut {
 		fail(w, 405, "Method not allowed")
 		return

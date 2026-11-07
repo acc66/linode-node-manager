@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -136,45 +137,12 @@ func TestAccountEgressConcurrentOwnership(t *testing.T) {
 		t.Fatalf("same IP accepted by %d accounts", accepted.Load())
 	}
 }
-func TestRefillRegionPoolAndMalformedUsage(t *testing.T) {
-	s, ids := newRefillTestServer(t)
-	response := `{"quota":1000,"used":10,"region_transfers":[{"id":"us-east","quota":100,"used":95}]}`
-	s.linodeHook = func(_ context.Context, _ string, _ string, path string, _ io.Reader) ([]byte, int, error) {
-		if strings.HasPrefix(path, "/regions/") {
-			return []byte(`{"id":"us-east","site_type":"core"}`), 200, nil
-		}
-		if path == "/account" {
-			return []byte(`{"balance":-100,"balance_uninvoiced":0}`), 200, nil
-		}
-		return []byte(response), 200, nil
-	}
-	u, err := s.refillUsage(context.Background(), ids[0], "us-east")
-	if err != nil || u.Percent != 95 || u.Quota != 100 {
-		t.Fatal(u, err)
-	}
-	if s.refillReady(refillTestConfig(ids), u) {
-		t.Fatal("global pool overrode exhausted regional pool")
-	}
-	response = `{"used":0,"quota":0}`
-	if _, err := s.refillUsage(context.Background(), ids[0], "us-east"); err == nil {
-		t.Fatal("current zero quota accepted")
-	}
-	u, err = s.refillUsageFor(context.Background(), ids[1], "us-east", true)
-	if err != nil || !u.Provisional {
-		t.Fatal("fresh account bootstrap rejected", err)
-	}
-	response = `{"used":0}`
-	if _, err := s.refillUsageFor(context.Background(), ids[1], "us-east", true); err == nil {
-		t.Fatal("missing quota treated as fresh")
-	}
-}
-func TestRefillTransferTriggeredHandoffAndUnknownCreate(t *testing.T) {
+func TestRefillAuthTriggeredHandoffAndUnknownCreate(t *testing.T) {
 	for _, unknown := range []bool{false, true} {
 		t.Run(strconvBool(unknown), func(t *testing.T) {
 			s, ids := newRefillTestServer(t)
 			st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10, CurrentIP: "192.0.2.10", Cursor: 1, Stage: "ready"}
 			creates, scriptRuns, shutdowns := 0, 0, 0
-			created := false
 			newLabel := ""
 			st.Config.OldPolicy = "shutdown"
 			s.linodeHook = func(ctx context.Context, account, method, path string, body io.Reader) ([]byte, int, error) {
@@ -182,22 +150,16 @@ func TestRefillTransferTriggeredHandoffAndUnknownCreate(t *testing.T) {
 					t.Error("refill request lost strict isolation")
 				}
 				switch {
-				case strings.HasPrefix(path, "/regions/"):
-					return []byte(`{"id":"us-east","site_type":"core"}`), 200, nil
-				case strings.HasPrefix(path, "/linode/types/"):
-					return []byte(`{"transfer":1000}`), 200, nil
 				case method == "GET" && path == "/linode/instances/10":
 					return []byte(`{"id":10,"region":"us-east","status":"running","ipv4":["192.0.2.10"]}`), 200, nil
 				case path == "/account":
-					return []byte(`{"balance":-100,"balance_uninvoiced":0}`), 200, nil
-				case path == "/account/transfer":
 					if account == ids[0] {
-						return []byte(`{"used":950,"quota":1000}`), 200, nil
+						return []byte(`{"errors":[{"reason":"Invalid Token"}]}`), 401, nil
 					}
-					if !created {
-						return []byte(`{"used":0,"quota":0}`), 200, nil
-					}
-					return []byte(`{"used":0,"quota":1000}`), 200, nil
+					return []byte(`{"balance":-100,"balance_uninvoiced":0}`), 200, nil
+				case strings.Contains(path, "/transfer"):
+					t.Error("credit-only switching queried transfer pool")
+					return nil, 500, nil
 				case method == "POST" && path == "/linode/instances":
 					creates++
 					if account != ids[1] {
@@ -208,7 +170,6 @@ func TestRefillTransferTriggeredHandoffAndUnknownCreate(t *testing.T) {
 						t.Fatal("bad payload")
 					}
 					newLabel = payload["label"].(string)
-					created = true
 					if unknown {
 						return nil, 0, errors.New("timeout")
 					}
@@ -363,71 +324,6 @@ func TestRefillScriptFailurePreservesOldInstance(t *testing.T) {
 		t.Fatalf("script failure did not preserve old instance: %v", err)
 	}
 }
-func TestRefillEmergencyStopRequiresConfirmedUsage(t *testing.T) {
-	s, ids := newRefillTestServer(t)
-	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10}
-	st.Config.StopPercent = 98
-	shutdowns := 0
-	valid := true
-	s.linodeHook = func(_ context.Context, _ string, method, path string, _ io.Reader) ([]byte, int, error) {
-		if method == "POST" {
-			shutdowns++
-			return []byte(`{}`), 200, nil
-		}
-		switch path {
-		case "/linode/instances/10":
-			return []byte(`{"id":10,"region":"us-east"}`), 200, nil
-		case "/regions/us-east":
-			return []byte(`{"id":"us-east","site_type":"core"}`), 200, nil
-		case "/account":
-			return []byte(`{"balance":-100,"balance_uninvoiced":0}`), 200, nil
-		case "/account/transfer":
-			if valid {
-				return []byte(`{"used":990,"quota":1000}`), 200, nil
-			}
-			return []byte(`{}`), 200, nil
-		}
-		return nil, 500, nil
-	}
-	s.refillEmergencyStop(refillContext(context.Background()), &st)
-	if shutdowns != 1 {
-		t.Fatal("configured emergency stop did not run")
-	}
-	valid = false
-	s.refillEmergencyStop(refillContext(context.Background()), &st)
-	if shutdowns != 1 {
-		t.Fatal("invalid metrics triggered shutdown")
-	}
-	valid = true
-	st.Config.StopPercent = 0
-	s.refillEmergencyStop(refillContext(context.Background()), &st)
-	if shutdowns != 1 {
-		t.Fatal("disabled emergency stop ran")
-	}
-}
-func TestRefillHighRateTriggersBeforePercentageCeiling(t *testing.T) {
-	s, ids := newRefillTestServer(t)
-	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10, Cursor: len(ids), Sample: &RefillSample{Account: ids[0], At: time.Now().Add(-time.Minute), Usage: RefillUsage{Used: 500}}}
-	s.linodeHook = func(_ context.Context, _ string, _ string, path string, _ io.Reader) ([]byte, int, error) {
-		switch path {
-		case "/linode/instances/10":
-			return []byte(`{"id":10,"region":"us-east"}`), 200, nil
-		case "/regions/us-east":
-			return []byte(`{"id":"us-east","site_type":"core"}`), 200, nil
-		case "/account":
-			return []byte(`{"balance":-100,"balance_uninvoiced":0}`), 200, nil
-		case "/account/transfer":
-			return []byte(`{"used":600,"quota":1000}`), 200, nil
-		}
-		return nil, 500, nil
-	}
-	if err := s.runRefill(context.Background(), &st, false); err != nil {
-		t.Fatal(err)
-	}
-	if st.Stage != "exhausted" || st.Sample.Usage.ReserveGB < 2000 {
-		t.Fatal("rapid traffic growth ignored", st.Stage, st.Sample)
-	}
-}
 func TestRefillProbeFailureIsNotUnreachable(t *testing.T) {
 	s, ids := newRefillTestServer(t)
 	config := DomesticProbeConfig{Host: "203.0.113.100", Port: 22, User: "root", Password: "test-password"}
@@ -446,5 +342,327 @@ func TestRefillProbeFailureIsNotUnreachable(t *testing.T) {
 	_, err := s.checkRefillChina(context.Background(), ids[0], 10, 22)
 	if err == nil || errors.Is(err, errDomesticTCPUnreachable) || calls != 1 {
 		t.Fatal("probe host failure misclassified", err, calls)
+	}
+}
+
+func TestRefillCreditIgnoresLegacyTrafficLimits(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10, Stage: "ready"}
+	st.Config.TransferPercent = -1
+	st.Config.ReserveGB = 100000
+	st.Config.StopPercent = 1
+	s.linodeHook = func(_ context.Context, _ string, method, path string, _ io.Reader) ([]byte, int, error) {
+		if method != "GET" {
+			t.Fatal("healthy account mutated")
+		}
+		if path == "/linode/instances?page_size=25" {
+			return []byte(`{"data":[]}`), 200, nil
+		}
+		if path != "/account" {
+			t.Fatal("unexpected read", path)
+		}
+		return []byte(`{"balance":-99.5,"balance_uninvoiced":0}`), 200, nil
+	}
+	if err := s.runRefill(context.Background(), &st, false); err != nil {
+		t.Fatal(err)
+	}
+	if st.Stage != "ready" || st.CurrentID != 10 || st.CurrentCredit == nil || *st.CurrentCredit != 99.5 {
+		t.Fatal("positive credit incorrectly triggered replacement")
+	}
+	if st.Config.TransferPercent != 0 || st.Config.ReserveGB != 0 || st.Config.StopPercent != 0 {
+		t.Fatal("legacy traffic triggers not cleared")
+	}
+}
+func TestRefillBootRunsScriptAfterIPCheck(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10}
+	st.Config.BootCheck = true
+	cfg, _ := json.Marshal(DomesticProbeConfig{Host: "203.0.113.100", Port: 22, User: "root", Password: "test-password"})
+	if err := s.saveRootPassword("domestic-probe", 0, "probe", string(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	checked, scriptRan := false, false
+	instance := Instance{ID: 10, Label: "running-node", Status: "running", IPv4: []string{"192.0.2.10"}}
+	s.linodeHook = func(_ context.Context, _ string, method, path string, _ io.Reader) ([]byte, int, error) {
+		if method != "GET" || path != "/linode/instances/10" {
+			t.Fatal("unexpected boot request", method, path)
+		}
+		b, _ := json.Marshal(instance)
+		return b, 200, nil
+	}
+	s.refillWaitPort = func(context.Context, string, int, int) (Instance, error) { return instance, nil }
+	s.sshRun = func(_ context.Context, host, script string) (string, error) {
+		if host == "203.0.113.100" {
+			if scriptRan {
+				t.Fatal("boot script ran before initial IP check")
+			}
+			checked = true
+			return "DOMESTIC_TCP_OPEN\n", nil
+		}
+		if strings.Contains(script, "echo initialized") {
+			if !checked {
+				t.Fatal("script ran before IP check")
+			}
+			scriptRan = true
+		}
+		return "", nil
+	}
+	if err := s.refillInstanceAction(refillContext(context.Background()), &st, "boot"); err != nil || !checked || !scriptRan {
+		t.Fatal("boot pipeline incomplete", err)
+	}
+}
+func TestRefillLegacyConfigMigratesToAPIMonitor(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids)}
+	st.Config.Trigger = ""
+	st.Config.CreditFloor = 99.5
+	st.Config.TransferPercent = 90
+	st.Config.StopPercent = 98
+	raw, _ := json.Marshal(st)
+	var legacy map[string]any
+	_ = json.Unmarshal(raw, &legacy)
+	delete(legacy["config"].(map[string]any), "trigger")
+	raw, _ = json.Marshal(legacy)
+	if err := s.saveRootPassword("refill-state", 0, "legacy", string(raw)); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := s.loadRefill()
+	if err != nil || loaded.Config.CreditFloor != 0 || loaded.Config.Trigger != "api" || loaded.Config.StopPercent != 0 || loaded.Config.TransferPercent != 0 {
+		t.Fatal("old traffic config remained active", err)
+	}
+}
+
+func TestRefillAPICheckDistinguishesProviderErrors(t *testing.T) {
+	for _, tc := range []struct {
+		status     int
+		body, kind string
+	}{
+		{401, `{"errors":[{"reason":"Invalid Token"}]}`, "auth_error"},
+		{403, `{"errors":[{"reason":"Not authorized"}]}`, "permission_error"},
+		{403, `<html>Proxy access denied</html>`, "invalid_response"},
+		{429, `{}`, "rate_limited"}, {503, `{}`, "server_error"},
+		{200, `{}`, "invalid_response"},
+	} {
+		s, ids := newRefillTestServer(t)
+		s.linodeHook = func(context.Context, string, string, string, io.Reader) ([]byte, int, error) {
+			return []byte(tc.body), tc.status, nil
+		}
+		got := s.checkRefillAPI(refillContext(context.Background()), ids[0])
+		if got.Kind != tc.kind {
+			t.Fatalf("HTTP %d => %s, want %s", tc.status, got.Kind, tc.kind)
+		}
+	}
+}
+func TestRefillLowCreditOnlyAlertsAndNeverChecksOldTCP(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10, Cursor: 1}
+	st.Config.CreditFloor = 1
+	s.refillWaitPort = func(context.Context, string, int, int) (Instance, error) {
+		t.Fatal("old TCP must not trigger API failover")
+		return Instance{}, nil
+	}
+	s.linodeHook = func(_ context.Context, account, method, path string, _ io.Reader) ([]byte, int, error) {
+		if account != ids[0] || method != "GET" {
+			t.Fatal("healthy API triggered account switch")
+		}
+		if path == "/account" {
+			return []byte(`{"balance":0,"balance_uninvoiced":0}`), 200, nil
+		}
+		return []byte(`{"data":[]}`), 200, nil
+	}
+	for i := 0; i < 2; i++ {
+		if err := s.runRefill(context.Background(), &st, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st.CurrentID != 10 || !st.CreditAlerted || st.Pending != nil {
+		t.Fatal("zero credit switched healthy account")
+	}
+	count := 0
+	for _, event := range st.History {
+		if strings.Contains(event.Message, "已到提醒阈值") {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatal("low credit warning repeated", count)
+	}
+}
+func TestRefillUnreachableUsesSpacedPersistentSamplesAndPreflightsCandidate(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10, Cursor: 1}
+	candidateChecks, creates := 0, 0
+	s.refillWait = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	s.linodeHook = func(_ context.Context, account, method, path string, _ io.Reader) ([]byte, int, error) {
+		if method == "POST" {
+			creates++
+			t.Fatal("unhealthy candidate created a server")
+		}
+		if account == ids[1] {
+			candidateChecks++
+			return []byte(`{}`), 503, nil
+		}
+		return nil, 0, errors.New("connection timeout")
+	}
+	if err := s.runRefill(context.Background(), &st, false); err != nil || st.APIFailures != 1 || candidateChecks != 0 {
+		t.Fatal(st.APIFailures, err)
+	}
+	if err := s.runRefill(context.Background(), &st, false); err != nil || st.APIFailures != 1 {
+		t.Fatal("refresh manufactured failures", err)
+	}
+	for i := 0; i < 2; i++ {
+		st.LastAPIFailure = time.Now().Add(-2 * time.Minute)
+		if err := s.runRefill(context.Background(), &st, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if st.APIFailures != 3 || candidateChecks != 1 || creates != 0 || st.Cursor != 1 || st.Stage != "api_wait" {
+		t.Fatal("candidate preflight skipped or consumed queue", candidateChecks, st.Cursor, st.Stage)
+	}
+	saved, err := s.loadRefill()
+	if err != nil || saved.APIFailures != 3 {
+		t.Fatal("failure count not persistent", err)
+	}
+}
+func TestRefillRecoveryResetsAPIFailures(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10, APIFailures: 2, LastAPIFailure: time.Now()}
+	s.linodeHook = func(_ context.Context, _ string, _ string, path string, _ io.Reader) ([]byte, int, error) {
+		if path == "/account" {
+			return []byte(`{"balance":-1,"balance_uninvoiced":0}`), 200, nil
+		}
+		return []byte(`{"data":[]}`), 200, nil
+	}
+	if err := s.runRefill(context.Background(), &st, false); err != nil || st.APIFailures != 0 || !st.LastAPIFailure.IsZero() {
+		t.Fatal("recovery did not reset streak", err)
+	}
+}
+func TestRefillUnlimitedIPRetriesUntilDomesticCheckPasses(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids)}
+	cfg, _ := json.Marshal(DomesticProbeConfig{Host: "203.0.113.100", Port: 22, User: "root", Password: "test-password"})
+	if err := s.saveRootPassword("domestic-probe", 0, "probe", string(cfg)); err != nil {
+		t.Fatal(err)
+	}
+	s.refillWait = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	instance := Instance{ID: 20, Label: "test-node", Status: "running", IPv4: []string{"192.0.2.20"}}
+	attempts := 0
+	s.refillWaitPort = func(context.Context, string, int, int) (Instance, error) { return instance, nil }
+	s.sshRun = func(context.Context, string, string) (string, error) {
+		if attempts < 5 {
+			return "DOMESTIC_TCP_CLOSED\n", nil
+		}
+		return "DOMESTIC_TCP_OPEN\n", nil
+	}
+	s.linodeHook = func(context.Context, string, string, string, io.Reader) ([]byte, int, error) {
+		b, _ := json.Marshal(instance)
+		return b, 200, nil
+	}
+	s.refillReplaceIP = func(context.Context, string, Instance, int, string, bool) (Instance, *IPChange, error) {
+		attempts++
+		if attempts < 5 {
+			return instance, &IPChange{}, fmt.Errorf("candidate rejected: %w", errDomesticTCPUnreachable)
+		}
+		return instance, &IPChange{}, nil
+	}
+	_, err := s.ensureRefillIP(refillContext(context.Background()), &st, ids[1], instance, 22)
+	if err != nil || attempts != 5 || st.IPAttempts != 5 {
+		t.Fatal("IP retry capped or failed", attempts, err)
+	}
+}
+func TestRefillIPRetryStopsOnUnknownOutcomeAndCanBePaused(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids)}
+	cfg, _ := json.Marshal(DomesticProbeConfig{Host: "203.0.113.100", Port: 22, User: "root", Password: "test-password"})
+	_ = s.saveRootPassword("domestic-probe", 0, "probe", string(cfg))
+	s.refillWait = func(ctx context.Context, _ time.Duration) error { return ctx.Err() }
+	instance := Instance{ID: 20, Status: "running", IPv4: []string{"192.0.2.20"}}
+	s.refillWaitPort = func(context.Context, string, int, int) (Instance, error) { return instance, nil }
+	s.sshRun = func(context.Context, string, string) (string, error) { return "DOMESTIC_TCP_CLOSED\n", nil }
+	calls := 0
+	s.refillReplaceIP = func(context.Context, string, Instance, int, string, bool) (Instance, *IPChange, error) {
+		calls++
+		return instance, nil, errors.New("allocation result unknown")
+	}
+	if _, err := s.ensureRefillIP(context.Background(), &st, ids[1], instance, 22); err == nil || calls != 1 {
+		t.Fatal("unknown IP allocation retried", err, calls)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.refillCancel = cancel
+	s.mu.Unlock()
+	s.refillMu.Lock()
+	response := apiRequest(newHandler(s), "POST", "/api/refill/pause", `{}`)
+	s.refillMu.Unlock()
+	if response.Code != 202 || ctx.Err() == nil {
+		t.Fatal("running workflow cannot be stopped", response.Code)
+	}
+}
+
+func TestRefillWritePermissionCheckedAtRealCreateBeforeSkipping(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids)}
+	order := []string{}
+	label := ""
+	s.linodeHook = func(_ context.Context, account, method, path string, body io.Reader) ([]byte, int, error) {
+		order = append(order, account+" "+method+" "+path)
+		if method == "GET" && path == "/account" {
+			return []byte(`{"balance":-100,"balance_uninvoiced":0}`), 200, nil
+		}
+		if method == "GET" && strings.HasPrefix(path, "/linode/instances?") {
+			return []byte(`{"data":[]}`), 200, nil
+		}
+		if method == "POST" && path == "/linode/instances" {
+			if account == ids[0] {
+				return []byte(`{"errors":[{"reason":"Not authorized"}]}`), 403, nil
+			}
+			var payload struct {
+				Label string `json:"label"`
+			}
+			_ = json.NewDecoder(body).Decode(&payload)
+			label = payload.Label
+			b, _ := json.Marshal(Instance{ID: 20, Label: label, Status: "running", IPv4: []string{"192.0.2.20"}})
+			return b, 201, nil
+		}
+		if method == "GET" && path == "/linode/instances/20" {
+			b, _ := json.Marshal(Instance{ID: 20, Label: label, Status: "running", IPv4: []string{"192.0.2.20"}})
+			return b, 200, nil
+		}
+		t.Fatal("unexpected request", method, path)
+		return nil, 500, nil
+	}
+	s.sshRun = func(context.Context, string, string) (string, error) { return "", nil }
+	s.refillWaitPort = func(ctx context.Context, a string, id, port int) (Instance, error) { return s.ipInstance(ctx, a, id) }
+	if err := s.runRefill(context.Background(), &st, false); err != nil {
+		t.Fatal(err)
+	}
+	if st.CurrentAccount != ids[1] || st.CurrentID != 20 || st.APIChecks[ids[0]].Kind != "permission_error" {
+		t.Fatal("write-permission rejection not handled")
+	}
+	for _, account := range ids {
+		firstList, firstCreate := -1, -1
+		for i, step := range order {
+			if step == account+" GET /linode/instances?page_size=25" && firstList < 0 {
+				firstList = i
+			}
+			if step == account+" POST /linode/instances" && firstCreate < 0 {
+				firstCreate = i
+			}
+		}
+		if firstList < 0 || firstCreate <= firstList {
+			t.Fatal("created before candidate preflight", order)
+		}
+	}
+}
+func TestRefillProxyFailureNeverRotatesAccount(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	st := RefillState{Config: refillTestConfig(ids), CurrentAccount: ids[0], CurrentID: 10, APIFailures: 2}
+	s.egressLookup = func(context.Context, string) (string, error) { return "", errors.New("proxy unavailable") }
+	s.linodeHook = func(context.Context, string, string, string, io.Reader) ([]byte, int, error) {
+		t.Fatal("Linode contacted despite failed proxy")
+		return nil, 500, nil
+	}
+	if err := s.runRefill(context.Background(), &st, false); err == nil || st.APIFailures != 0 || st.Pending != nil {
+		t.Fatal("proxy error rotated account", err)
 	}
 }

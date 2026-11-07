@@ -17,8 +17,9 @@ import (
 )
 
 type RefillConfig struct {
-	ReserveGB       float64  `json:"reserve_gb"`
-	StopPercent     float64  `json:"stop_percent"`
+	Trigger         string   `json:"trigger"`
+	ReserveGB       float64  `json:"reserve_gb,omitempty"`
+	StopPercent     float64  `json:"stop_percent,omitempty"`
 	Enabled         bool     `json:"enabled"`
 	Accounts        []string `json:"accounts"`
 	Region          string   `json:"region"`
@@ -28,7 +29,7 @@ type RefillConfig struct {
 	Script          string   `json:"script"`
 	Domain          string   `json:"domain"`
 	CreditFloor     float64  `json:"credit_floor"`
-	TransferPercent float64  `json:"transfer_percent"`
+	TransferPercent float64  `json:"transfer_percent,omitempty"`
 	IntervalMinutes int      `json:"interval_minutes"`
 	BootCheck       bool     `json:"boot_check"`
 	AutoIP          bool     `json:"auto_ip"`
@@ -53,35 +54,26 @@ type RefillRetired struct {
 	ShutdownRequested bool   `json:"shutdown_requested"`
 }
 type RefillState struct {
-	Sample         *RefillSample   `json:"sample,omitempty"`
-	Retired        []RefillRetired `json:"retired"`
-	Config         RefillConfig    `json:"config"`
-	CurrentAccount string          `json:"current_account"`
-	CurrentID      int             `json:"current_instance"`
-	CurrentIP      string          `json:"current_ip"`
-	Cursor         int             `json:"cursor"`
-	Stage          string          `json:"stage"`
-	LastCheck      time.Time       `json:"last_check"`
-	Pending        *RefillPending  `json:"pending,omitempty"`
-	History        []RefillEvent   `json:"history"`
-}
-
-type RefillSample struct {
-	Usage   RefillUsage `json:"usage"`
-	At      time.Time   `json:"at"`
-	Account string      `json:"account_id"`
-}
-type RefillUsage struct {
-	ReserveGB   float64 `json:"reserve_gb"`
-	Provisional bool    `json:"provisional"`
-	Credit      float64 `json:"credit_usd"`
-	Used        float64 `json:"used_gb"`
-	Quota       float64 `json:"quota_gb"`
-	Percent     float64 `json:"percent"`
+	APIChecks      map[string]RefillAPICheck `json:"api_checks"`
+	APIFailures    int                       `json:"api_failures"`
+	LastAPIFailure time.Time                 `json:"last_api_failure"`
+	CreditAlerted  bool                      `json:"credit_alerted"`
+	IPAttempts     int                       `json:"ip_attempts"`
+	CurrentCredit  *float64                  `json:"current_credit,omitempty"`
+	Retired        []RefillRetired           `json:"retired"`
+	Config         RefillConfig              `json:"config"`
+	CurrentAccount string                    `json:"current_account"`
+	CurrentID      int                       `json:"current_instance"`
+	CurrentIP      string                    `json:"current_ip"`
+	Cursor         int                       `json:"cursor"`
+	Stage          string                    `json:"stage"`
+	LastCheck      time.Time                 `json:"last_check"`
+	Pending        *RefillPending            `json:"pending,omitempty"`
+	History        []RefillEvent             `json:"history"`
 }
 
 func defaultRefillConfig() RefillConfig {
-	return RefillConfig{ReserveGB: 20, Label: "refill-node", Image: "linode/debian12", CreditFloor: 1, TransferPercent: 90, IntervalMinutes: 5, BootCheck: true, AutoIP: true, CheckPort: 22, HealthPort: 22, OldPolicy: "keep"}
+	return RefillConfig{Trigger: "api", Label: "refill-node", Image: "linode/debian12", CreditFloor: 0, IntervalMinutes: 1, BootCheck: true, AutoIP: true, CheckPort: 22, HealthPort: 22, OldPolicy: "keep"}
 }
 func (s *Server) loadRefill() (RefillState, error) {
 	st := RefillState{Config: defaultRefillConfig(), Stage: "idle", History: []RefillEvent{}}
@@ -92,9 +84,17 @@ func (s *Server) loadRefill() (RefillState, error) {
 	if !ok {
 		return st, nil
 	}
+	st.Config.Trigger = "" // Detect legacy records without an explicit trigger.
 	if json.Unmarshal([]byte(raw), &st) != nil {
 		return st, errors.New("补号记录损坏，已停止自动操作")
 	}
+	if st.Config.Trigger != "api" {
+		st.Config.CreditFloor = 0
+	}
+	st.Config.Trigger = "api"
+	st.Config.ReserveGB = 0
+	st.Config.StopPercent = 0
+	st.Config.TransferPercent = 0
 	return st, nil
 }
 func (s *Server) saveRefill(st *RefillState, message string) error {
@@ -136,15 +136,16 @@ func (s *Server) validateRefill(c *RefillConfig) error {
 	if len(c.Script) > 48<<10 {
 		return errors.New("脚本不能超过 48KB")
 	}
-	if math.IsNaN(c.CreditFloor) || math.IsInf(c.CreditFloor, 0) || c.CreditFloor < 0 || c.CreditFloor > 10000 || c.TransferPercent < 1 || c.TransferPercent > 95 || math.IsNaN(c.TransferPercent) {
-		return errors.New("额度阈值无效；流量阈值须在 1%-95%")
+	if math.IsNaN(c.CreditFloor) || math.IsInf(c.CreditFloor, 0) || c.CreditFloor < 0 || c.CreditFloor > 10000 {
+		return errors.New("剩余额度阈值无效，只用于提醒，不触发切号")
 	}
 	if c.IntervalMinutes < 1 || c.IntervalMinutes > 60 || c.CheckPort < 1 || c.CheckPort > 65535 || c.HealthPort < 1 || c.HealthPort > 65535 {
 		return errors.New("检查间隔或端口无效")
 	}
-	if c.ReserveGB < 0 || c.ReserveGB > 1000000 || math.IsNaN(c.ReserveGB) || math.IsInf(c.ReserveGB, 0) || c.StopPercent != 0 && (c.StopPercent <= c.TransferPercent || c.StopPercent > 99) {
-		return errors.New("流量预留或紧急停机阈值无效，停机阈值须高于接替阈值且不超过 99%")
-	}
+	c.Trigger = "api"
+	c.TransferPercent = 0
+	c.ReserveGB = 0
+	c.StopPercent = 0
 	if c.OldPolicy != "keep" && c.OldPolicy != "shutdown" {
 		return errors.New("旧机策略仅支持保留或验证完成后关机")
 	}
@@ -214,74 +215,15 @@ func refillCredit(body []byte, now time.Time) (float64, error) {
 	return math.Max(credit-*data.Pending, 0), nil
 }
 
-func (s *Server) refillUsage(ctx context.Context, account, region string) (RefillUsage, error) {
-	return s.refillUsageFor(ctx, account, region, false)
-}
-func (s *Server) refillUsageFor(ctx context.Context, account, region string, fresh bool) (RefillUsage, error) {
-	var usage RefillUsage
-
-	regionBody, regionStatus, regionErr := s.linodeFor(ctx, account, "GET", "/regions/"+region, nil)
-	var regionInfo struct {
-		ID   string `json:"id"`
-		Site string `json:"site_type"`
-	}
-	if regionErr != nil {
-		return usage, regionErr
-	}
-	if regionStatus != 200 || json.Unmarshal(regionBody, &regionInfo) != nil || regionInfo.ID != region || regionInfo.Site != "core" {
-		return usage, errors.New("当前自动接替仅支持已核实的 core 地区流量池；未将其他地区用量误计入全局池")
-	}
+func (s *Server) refillAccountCredit(ctx context.Context, account string) (float64, error) {
 	body, status, err := s.linodeFor(ctx, account, "GET", "/account", nil)
 	if err != nil {
-		return usage, err
+		return 0, err
 	}
 	if status != 200 {
-		return usage, fmt.Errorf("账号额度查询 HTTP %d，未切换账号", status)
+		return 0, fmt.Errorf("账号额度查询 HTTP %d，未判定为额度耗尽", status)
 	}
-	usage.Credit, err = refillCredit(body, time.Now().UTC())
-	if err != nil {
-		return usage, err
-	}
-	body, status, err = s.linodeFor(ctx, account, "GET", "/account/transfer", nil)
-	if err != nil {
-		return usage, err
-	}
-	if status != 200 {
-		return usage, fmt.Errorf("账号流量查询 HTTP %d", status)
-	}
-	var transfer struct {
-		Used    *float64 `json:"used"`
-		Quota   *float64 `json:"quota"`
-		Regions []struct {
-			ID    string   `json:"id"`
-			Used  *float64 `json:"used"`
-			Quota *float64 `json:"quota"`
-		} `json:"region_transfers"`
-	}
-	if json.Unmarshal(body, &transfer) != nil {
-		return usage, errors.New("流量响应格式无效")
-	}
-	used, quota := transfer.Used, transfer.Quota
-	for _, r := range transfer.Regions {
-		if r.ID == region {
-			used, quota = r.Used, r.Quota
-			break
-		}
-	}
-	if fresh && used != nil && quota != nil && *used == 0 && *quota == 0 {
-		usage.Provisional = true
-		return usage, nil
-	}
-	if used == nil || quota == nil || *used < 0 || *quota <= 0 {
-		return usage, errors.New("未取得有效流量池配额，不能假定新账号拥有 1TB")
-	}
-	usage.Used = *used
-	usage.Quota = *quota
-	usage.Percent = *used / *quota * 100
-	return usage, nil
-}
-func (s *Server) refillReady(c RefillConfig, u RefillUsage) bool {
-	return u.Credit > c.CreditFloor && u.Percent < c.TransferPercent && (u.Provisional || u.Quota-u.Used > math.Max(c.ReserveGB, u.ReserveGB))
+	return refillCredit(body, time.Now().UTC())
 }
 
 func (s *Server) runRefill(ctx context.Context, st *RefillState, resume bool) error {
@@ -332,53 +274,43 @@ func (s *Server) runRefill(ctx context.Context, st *RefillState, resume bool) er
 		return err
 	}
 	if st.CurrentID > 0 {
-		currentInstance, lookupErr := s.ipInstance(ctx, st.CurrentAccount, st.CurrentID)
-		if lookupErr != nil {
-			return lookupErr
-		}
-		usage, err := s.refillUsage(ctx, st.CurrentAccount, currentInstance.Region)
+		switchAccount, err := s.currentRefillAPI(ctx, st)
 		if err != nil {
 			return err
 		}
-
-		usage.ReserveGB = st.Config.ReserveGB
-		if prior := st.Sample; prior != nil && prior.Account == st.CurrentAccount && prior.At.UTC().Format("2006-01") == time.Now().UTC().Format("2006-01") {
-			seconds := time.Since(prior.At).Seconds()
-			if seconds >= 1 && usage.Used >= prior.Usage.Used {
-				usage.ReserveGB = math.Max(usage.ReserveGB, (usage.Used-prior.Usage.Used)/seconds*1800)
-			}
-		}
-		st.Sample = &RefillSample{Usage: usage, At: time.Now().UTC(), Account: st.CurrentAccount}
-		if s.refillReady(st.Config, usage) {
-			st.Stage = "ready"
-			return s.saveRefill(st, fmt.Sprintf("检查完成：估算额度 $%.2f，流量 %.2f/%.2f GB (%.1f%%)", usage.Credit, usage.Used, usage.Quota, usage.Percent))
-		}
-		if err := s.saveRefill(st, "当前账号额度或流量达到阈值，查找后续账号"); err != nil {
-			return err
+		if !switchAccount {
+			return nil
 		}
 	}
 	for index := st.Cursor; index < len(st.Config.Accounts); index++ {
 		account := st.Config.Accounts[index]
-		usage, err := s.refillUsageFor(ctx, account, st.Config.Region, true)
+		check, err := s.candidateRefillAPI(ctx, account)
 		if err != nil {
 			return err
 		}
-		if !s.refillReady(st.Config, usage) {
+		if err := s.saveRefillCheck(st, check); err != nil {
+			return err
+		}
+		if refillAuthFailure(check) {
 			st.Cursor = index + 1
-			if err := s.saveRefill(st, "跳过额度或流量不足的账号 "+account); err != nil {
+			if err := s.saveRefill(st, "候选账号 "+account+"："+check.Message+"，跳过"); err != nil {
 				return err
 			}
 			continue
 		}
-		planBody, planStatus, planErr := s.linodeFor(ctx, account, "GET", "/linode/types/"+st.Config.Type, nil)
-		var plan struct {
-			Transfer *float64 `json:"transfer"`
+		if check.Kind != "ok" {
+			st.Stage = "api_wait"
+			return s.saveRefill(st, "候选账号 "+account+"："+check.Message+"；保留队列位置，等待重试，未建机")
 		}
-		if planErr != nil {
-			return planErr
+		if check.Credit == nil || *check.Credit <= 0 {
+			st.Cursor = index + 1
+			if err := s.saveRefill(st, "候选账号无可用估算额度，跳过 "+account); err != nil {
+				return err
+			}
+			continue
 		}
-		if planStatus != 200 || json.Unmarshal(planBody, &plan) != nil || plan.Transfer == nil || *plan.Transfer <= 0 {
-			return errors.New("所选套餐没有可核实的赠送流量，未创建实例")
+		if err := s.saveRefill(st, "候选账号 API 认证、账号读取和实例列表权限检查通过；准备建机 "+account); err != nil {
+			return err
 		}
 		// One persistent intent before POST. Unknown outcomes never create again.
 		random := make([]byte, 24)
@@ -398,6 +330,31 @@ func (s *Server) runRefill(ctx context.Context, st *RefillState, resume bool) er
 			return errors.New("创建结果未知，已暂停；请按记录标签核对，禁止重复建机")
 		}
 		if status != 200 && status != 201 {
+			if status == 429 {
+				st.Pending = nil
+				st.Stage = "api_wait"
+				return s.saveRefill(st, "创建接口限流，保留当前候选账号，等待后重试；未切换其他账号")
+			}
+
+			if (status == 401 || status == 403) && validLinodeError(body) {
+				st.Pending = nil
+				st.Cursor = index + 1
+				check.Status = status
+				check.Kind = "auth_error"
+				check.Message = "创建操作明确返回认证失败"
+				if status == 403 {
+					check.Kind = "permission_error"
+					check.Message = "创建操作明确返回权限不足"
+				}
+				if err := s.saveRefillCheck(st, check); err != nil {
+					return err
+				}
+				if err := s.saveRefill(st, fmt.Sprintf("建机明确返回 HTTP %d，跳过该账号；未将结果未知当作失败", status)); err != nil {
+					return err
+				}
+				continue
+			}
+
 			if status >= 400 && status < 500 && status != 408 && status != 409 {
 				st.Pending = nil
 			}
@@ -414,7 +371,6 @@ func (s *Server) runRefill(ctx context.Context, st *RefillState, resume bool) er
 		}
 		return s.finishRefill(ctx, st)
 	}
-	s.refillEmergencyStop(ctx, st)
 	st.Config.Enabled = false
 	st.Stage = "exhausted"
 	return s.saveRefill(st, "账号队列已用完；暂停自动补号，原机保留")
@@ -434,10 +390,8 @@ func (s *Server) checkRefillChina(ctx context.Context, account string, id, port 
 			return instance, err
 		}
 		if attempt < 2 {
-			select {
-			case <-ctx.Done():
-				return instance, ctx.Err()
-			case <-time.After(2 * time.Second):
+			if err := s.refillDelay(ctx, 2*time.Second); err != nil {
+				return instance, err
 			}
 		}
 	}
@@ -476,50 +430,25 @@ func (s *Server) finishRefill(ctx context.Context, st *RefillState) error {
 		return err
 	}
 	if st.Config.BootCheck {
-		instance, err = s.checkRefillChina(ctx, p.Account, p.ID, st.Config.CheckPort)
-		if errors.Is(err, errDomesticTCPUnreachable) && st.Config.AutoIP {
-			if err := s.saveRefill(st, "国内连续三次不通，尝试一次原机换 IP"); err != nil {
-				return err
-			}
-			instance, _, err = s.replaceIPFromBoot(ctx, p.Account, instance, st.Config.CheckPort, "aliyun", true)
-		}
+		instance, err = s.ensureRefillIP(ctx, st, p.Account, instance, st.Config.CheckPort)
 		if err != nil {
 			return err
 		}
 	}
 
-	var verifiedUsage RefillUsage
-	for attempt := 0; attempt < 12; attempt++ {
-		verifiedUsage, err = s.refillUsage(ctx, p.Account, st.Config.Region)
-		if err == nil {
-			break
-		}
-		if !strings.Contains(err.Error(), "未取得有效流量池配额") {
-			return err
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(5 * time.Second):
-		}
-	}
+	verifiedCredit, err := s.refillAccountCredit(ctx, p.Account)
 	if err != nil {
 		return err
 	}
-	if !s.refillReady(st.Config, verifiedUsage) {
-		return errors.New("新机创建后账号额度或实际流量池不足，保留新机但不切换业务")
+	if verifiedCredit <= 0 {
+		return errors.New("目标账号额度不足，保留已创建实例并暂停接替")
 	}
 	st.Stage = "script"
-	if err := s.saveRefill(st, "执行首次初始化脚本（输出不写入操作日志，避免泄露脚本密钥）"); err != nil {
+	if err := s.saveRefill(st, "IP 检查完成，执行开机脚本（输出不写入操作日志，避免泄露脚本密钥）"); err != nil {
 		return err
 	}
-	// Only SSH readiness may be retried. Never retry a user script automatically.
-	if _, err := s.tuneNode(ctx, p.Account, instance, false); err != nil {
-		return errors.New("SSH 初始化失败；保留新机，未切换入口")
-	}
-	script := "set -eu\nexport LNM_ACCOUNT_ID=" + shellQuote(p.Account) + "\nexport LNM_INSTANCE_ID=" + strconv.Itoa(p.ID) + "\nexport LNM_IPV4=" + shellQuote(publicIP(instance)) + "\n" + st.Config.Script + "\n"
-	if _, err := s.deploySSH(ctx, p.Account, instance, script); err != nil {
-		return errors.New("启动脚本失败或执行结果未知；保留新机与原机，需人工核对后恢复")
+	if err := s.runRefillBootScript(ctx, p.Account, instance, st.Config.Script); err != nil {
+		return err
 	}
 	st.Stage = "health"
 	if err := s.saveRefill(st, "启动脚本已完成，检查业务端口"); err != nil {
@@ -555,7 +484,11 @@ func (s *Server) finishRefill(ctx context.Context, st *RefillState) error {
 		}
 	}
 	st.Pending = nil
-	st.Sample = nil
+	st.CurrentCredit = &verifiedCredit
+	st.APIFailures = 0
+	st.LastAPIFailure = time.Time{}
+	st.CreditAlerted = false
+	st.IPAttempts = 0
 	st.Stage = "ready"
 	if err := s.saveRefill(st, "接替成功，新 IP="+publicIP(instance)+"；旧实例未删除"); err != nil {
 		return err
@@ -563,7 +496,7 @@ func (s *Server) finishRefill(ctx context.Context, st *RefillState) error {
 	if oldID > 0 && st.Config.OldPolicy == "shutdown" {
 		// New service is verified before asking Linode to stop the previous one.
 		if err := s.ipJSON(ctx, oldAccount, "POST", fmt.Sprintf("/linode/instances/%d/shutdown", oldID), map[string]any{}, nil); err != nil {
-			return errors.New("新机已接替，但旧机关机结果未确认；请人工检查以防继续跑流量")
+			return s.saveRefill(st, "新机已接替，但旧账号无法确认关机；旧机可能继续计费，请人工处理")
 		}
 		st.Retired[len(st.Retired)-1].ShutdownRequested = true
 		return s.saveRefill(st, "旧机 #"+strconv.Itoa(oldID)+" 关机请求已接受；关机仍收取实例费用")
@@ -573,7 +506,16 @@ func (s *Server) finishRefill(ctx context.Context, st *RefillState) error {
 
 func (s *Server) refillWorker(resume bool, action string) {
 	defer s.refillMu.Unlock()
-	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Minute)
+	ctx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.refillCancel = cancel
+	requested := s.refillPauseRequested
+	s.refillPauseRequested = false
+	s.mu.Unlock()
+	defer func() { s.mu.Lock(); s.refillCancel = nil; s.mu.Unlock() }()
+	if requested {
+		cancel()
+	}
 	defer cancel()
 	st, err := s.loadRefill()
 	if err != nil {
@@ -585,11 +527,11 @@ func (s *Server) refillWorker(resume bool, action string) {
 		err = s.runRefill(ctx, &st, resume)
 	}
 	if err != nil {
-		if action == "" {
-			s.refillEmergencyStop(refillContext(ctx), &st)
-		}
 		st.Config.Enabled = false
 		st.Stage = "failed"
+		if errors.Is(err, context.Canceled) {
+			st.Stage = "paused"
+		}
 		if saveErr := s.saveRefill(&st, err.Error()); saveErr != nil {
 			return
 		}
@@ -623,11 +565,9 @@ func (s *Server) refillInstanceAction(ctx context.Context, st *RefillState, acti
 			return err
 		}
 		if st.Config.BootCheck {
-			instance, err = s.checkRefillChina(ctx, st.CurrentAccount, st.CurrentID, st.Config.CheckPort)
-			if errors.Is(err, errDomesticTCPUnreachable) && st.Config.AutoIP {
-				instance, _, err = s.replaceIPFromBoot(ctx, st.CurrentAccount, instance, st.Config.CheckPort, "aliyun", true)
-			}
+			instance, err = s.ensureRefillIP(ctx, st, st.CurrentAccount, instance, st.Config.CheckPort)
 		}
+
 	case "change-ip":
 		instance, _, err = s.replaceIPFromBoot(ctx, st.CurrentAccount, instance, st.Config.CheckPort, "aliyun", true)
 	default:
@@ -635,6 +575,18 @@ func (s *Server) refillInstanceAction(ctx context.Context, st *RefillState, acti
 	}
 	if err != nil {
 		return err
+	}
+	if action == "boot" {
+		if err := s.saveRefill(st, "开机 IP 检查完成，执行开机脚本"); err != nil {
+			return err
+		}
+		if err := s.runRefillBootScript(ctx, st.CurrentAccount, instance, st.Config.Script); err != nil {
+			return err
+		}
+		instance, err = s.waitRefillPort(ctx, st.CurrentAccount, st.CurrentID, st.Config.HealthPort)
+		if err != nil {
+			return err
+		}
 	}
 	if action == "change-ip" || action == "boot" {
 		if err := s.refillDNS(ctx, st.Config.Domain, instance); err != nil {
@@ -649,7 +601,7 @@ func (s *Server) refillScheduler(ctx context.Context) {
 	// A crash during a mutation must never silently replay a create or script.
 	if s.refillMu.TryLock() {
 		st, err := s.loadRefill()
-		if err == nil && st.Stage != "idle" && st.Stage != "ready" && st.Stage != "failed" && st.Stage != "exhausted" {
+		if err == nil && st.Stage != "idle" && st.Stage != "ready" && st.Stage != "failed" && st.Stage != "exhausted" && st.Stage != "api_wait" && st.Stage != "paused" {
 			st.Config.Enabled = false
 			st.Stage = "interrupted"
 			_ = s.saveRefill(&st, "进程重启时发现未完成操作，已暂停；请核对后恢复")
@@ -680,6 +632,7 @@ func (s *Server) registerRefill(mux *http.ServeMux) {
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
 		_, _ = io.WriteString(w, refillPage)
 	}))
+	mux.HandleFunc("POST /api/accounts/{id}/api-check", s.auth(s.accountAPICheckAPI))
 	mux.HandleFunc("GET /api/refill", s.auth(s.refillAPI))
 	mux.HandleFunc("PUT /api/refill", s.auth(s.refillAPI))
 	mux.HandleFunc("POST /api/refill/{action}", s.auth(s.refillAPI))
@@ -687,6 +640,22 @@ func (s *Server) registerRefill(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/accounts/{id}/transfer", s.auth(s.accountTransferAPI))
 }
 func (s *Server) refillAPI(w http.ResponseWriter, r *http.Request) {
+	if r.Method == "POST" && r.PathValue("action") == "pause" && !s.refillMu.TryLock() {
+		s.mu.Lock()
+		cancel := s.refillCancel
+		if cancel == nil {
+			s.refillPauseRequested = true
+		}
+		s.mu.Unlock()
+		if cancel != nil {
+			cancel()
+		}
+		send(w, 202, map[string]string{"status": "stopping", "message": "正在安全停止；已发送的请求将保留记录待核对"})
+		return
+	} else if r.Method == "POST" && r.PathValue("action") == "pause" {
+		s.refillMu.Unlock()
+	}
+
 	if r.Method == "GET" {
 		st, err := s.loadRefill()
 		if err != nil {
@@ -766,6 +735,10 @@ func (s *Server) refillAPI(w http.ResponseWriter, r *http.Request) {
 		}
 		st.Config = in.Config
 		st.CurrentAccount = in.Account
+		st.CurrentCredit = nil
+		st.APIFailures = 0
+		st.LastAPIFailure = time.Time{}
+		st.CreditAlerted = false
 		st.CurrentID = in.Instance
 		st.Stage = "idle"
 		st.Cursor = 0
@@ -882,35 +855,15 @@ func (s *Server) waitRefillPort(ctx context.Context, account string, id, port in
 	}
 	return s.waitBootProbePort(ctx, account, id, port)
 }
-func (s *Server) refillMutationBusy() bool {
-	if !s.refillMu.TryLock() {
-		return true
-	}
-	s.refillMu.Unlock()
-	return false
-}
 
-// Optional circuit breaker: stop the current VM only on a fresh, confirmed
-// account-pool reading. It deliberately trades availability for a cost ceiling.
-func (s *Server) refillEmergencyStop(ctx context.Context, st *RefillState) {
-	if st.Config.StopPercent == 0 || st.CurrentID <= 0 {
-		return
+// Retry only SSH readiness/system tuning, never the user's script.
+func (s *Server) runRefillBootScript(ctx context.Context, account string, instance Instance, script string) error {
+	if _, err := s.tuneNode(ctx, account, instance, false); err != nil {
+		return errors.New("SSH 初始化失败，未切换入口")
 	}
-	current, lookupErr := s.ipInstance(ctx, st.CurrentAccount, st.CurrentID)
-	if lookupErr != nil {
-		return
+	command := "set -eu\nexport LNM_ACCOUNT_ID=" + shellQuote(account) + "\nexport LNM_INSTANCE_ID=" + strconv.Itoa(instance.ID) + "\nexport LNM_IPV4=" + shellQuote(publicIP(instance)) + "\n" + script + "\n"
+	if _, err := s.deploySSH(ctx, account, instance, command); err != nil {
+		return errors.New("开机脚本失败或执行结果未知；保留实例并暂停，需人工核对后恢复")
 	}
-	usage, err := s.refillUsage(ctx, st.CurrentAccount, current.Region)
-	if err != nil || usage.Percent < st.Config.StopPercent {
-		return
-	}
-	if err = s.saveRefill(st, "流量达到已配置紧急上限，准备关闭当前实例以停止继续跑流量"); err != nil {
-		return
-	}
-	err = s.ipJSON(ctx, st.CurrentAccount, "POST", fmt.Sprintf("/linode/instances/%d/shutdown", st.CurrentID), map[string]any{}, nil)
-	text := "紧急关机请求已接受；实例费用继续产生"
-	if err != nil {
-		text = "紧急关机结果未确认，请立即人工处理"
-	}
-	_ = s.saveRefill(st, text)
+	return nil
 }

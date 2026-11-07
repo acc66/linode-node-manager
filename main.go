@@ -21,20 +21,24 @@ import (
 )
 
 type Server struct {
-	linodeHook     func(context.Context, string, string, string, io.Reader) ([]byte, int, error)
-	refillWaitPort func(context.Context, string, int, int) (Instance, error)
-	refillMu       sync.RWMutex
-	egressLookup   func(context.Context, string) (string, error)
-	wp2Mu          sync.Mutex
-	client         *http.Client
-	mu             sync.RWMutex
-	status         map[int]Snapshot
-	accountStatus  map[string]Snapshot
-	credentials    *accountStore
-	accounts       *accountStore
-	jobs           map[string]Job
-	skipBootTuning bool
-	sshRun         func(context.Context, string, string) (string, error)
+	refillWait           func(context.Context, time.Duration) error
+	refillReplaceIP      func(context.Context, string, Instance, int, string, bool) (Instance, *IPChange, error)
+	refillCancel         context.CancelFunc
+	refillPauseRequested bool
+	linodeHook           func(context.Context, string, string, string, io.Reader) ([]byte, int, error)
+	refillWaitPort       func(context.Context, string, int, int) (Instance, error)
+	refillMu             sync.RWMutex
+	egressLookup         func(context.Context, string) (string, error)
+	wp2Mu                sync.Mutex
+	client               *http.Client
+	mu                   sync.RWMutex
+	status               map[int]Snapshot
+	accountStatus        map[string]Snapshot
+	credentials          *accountStore
+	accounts             *accountStore
+	jobs                 map[string]Job
+	skipBootTuning       bool
+	sshRun               func(context.Context, string, string) (string, error)
 }
 type Snapshot struct {
 	AccountID        string  `json:"account_id,omitempty"`

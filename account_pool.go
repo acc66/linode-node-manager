@@ -25,6 +25,11 @@ type AccountEgress struct {
 	Account string         `json:"account_id"`
 	Records []EgressRecord `json:"records"`
 }
+type egressConflict struct {
+	AccountID   string `json:"account_id"`
+	AccountName string `json:"account_name"`
+	Proxy       string `json:"proxy"`
+}
 
 func (s *Server) isolationEnabled() bool {
 	if s.credentials == nil {
@@ -215,6 +220,48 @@ func (s *Server) accountEgressAPI(w http.ResponseWriter, r *http.Request) {
 	send(w, 200, map[string]string{"ip": ip, "account_id": account})
 }
 
+func (s *Server) egressConflicts(ip, excludeAccount string) ([]egressConflict, error) {
+	accountNames := map[string]string{"legacy": "默认账号 (.env)"}
+	if s.accounts != nil {
+		for _, managed := range s.accounts.list() {
+			accountNames[managed.ID] = managed.Name
+		}
+	}
+	conflicts := make([]egressConflict, 0)
+	store := s.credentials
+	store.mu.RLock()
+	defer store.mu.RUnlock()
+	seen := map[string]bool{}
+	for key, record := range store.accounts {
+		if !strings.HasPrefix(key, "account-egress-") {
+			continue
+		}
+		var history AccountEgress
+		if json.Unmarshal([]byte(record.Token), &history) != nil {
+			return nil, errors.New("账号出口记录损坏，无法验证代理独占性")
+		}
+		if history.Account == excludeAccount {
+			continue
+		}
+		for _, used := range history.Records {
+			if used.IP != ip {
+				continue
+			}
+			key := history.Account + "\x00" + used.Proxy
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			name := accountNames[history.Account]
+			if name == "" {
+				name = history.Account
+			}
+			conflicts = append(conflicts, egressConflict{AccountID: history.Account, AccountName: name, Proxy: used.Proxy})
+		}
+	}
+	return conflicts, nil
+}
+
 // proxyPoolEgressTestAPI checks a pool proxy's real public exit before the user
 // binds it or sends any Linode API request. It never receives a Linode token
 // and does not add a record to an account's usage history.
@@ -251,13 +298,6 @@ func (s *Server) proxyPoolEgressTestAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	ip = parsed.String()
-	accountNames := map[string]string{"legacy": "默认账号 (.env)"}
-	if s.accounts != nil {
-		for _, managed := range s.accounts.list() {
-			accountNames[managed.ID] = managed.Name
-		}
-	}
-	conflicts := make([]map[string]string, 0)
 	store := s.credentials
 	store.mu.RLock()
 	endpoint, endpointErr := proxyEndpointLocked(store, "pool:"+proxyID)
@@ -266,37 +306,12 @@ func (s *Server) proxyPoolEgressTestAPI(w http.ResponseWriter, r *http.Request) 
 		fail(w, 409, "代理池地址无效，请检查代理配置")
 		return
 	}
-	seenConflict := map[string]bool{}
-	for key, record := range store.accounts {
-		if !strings.HasPrefix(key, "account-egress-") {
-			continue
-		}
-		var history AccountEgress
-		if json.Unmarshal([]byte(record.Token), &history) != nil {
-			store.mu.RUnlock()
-			fail(w, 500, "账号出口记录损坏，无法验证代理独占性")
-			return
-		}
-		if history.Account == account {
-			continue
-		}
-		for _, used := range history.Records {
-			if used.IP != ip {
-				continue
-			}
-			key := history.Account + "\x00" + used.Proxy
-			if seenConflict[key] {
-				continue
-			}
-			seenConflict[key] = true
-			name := accountNames[history.Account]
-			if name == "" {
-				name = history.Account
-			}
-			conflicts = append(conflicts, map[string]string{"account_id": history.Account, "account_name": name, "proxy": used.Proxy})
-		}
-	}
 	store.mu.RUnlock()
+	conflicts, conflictErr := s.egressConflicts(ip, account)
+	if conflictErr != nil {
+		fail(w, 500, conflictErr.Error())
+		return
+	}
 	send(w, 200, map[string]any{
 		"ip": ip, "proxy": endpoint, "available": len(conflicts) == 0,
 		"conflicts": conflicts,

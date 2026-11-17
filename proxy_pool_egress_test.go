@@ -63,3 +63,49 @@ func TestProxyPoolEgressCanBeCheckedBeforeBinding(t *testing.T) {
 		t.Fatal("pre-bind egress test unexpectedly recorded account usage")
 	}
 }
+
+func TestBatchProxyPoolEgressReportsEveryIPAndHistoryOwner(t *testing.T) {
+	s, ids := newRefillTestServer(t)
+	entries, _ := json.Marshal([]poolProxy{
+		{ID: "shared", Name: "port 40001", URL: "http://user:secret@proxy.example:40001"},
+		{ID: "unique", Name: "port 40002", URL: "http://user:secret@proxy.example:40002"},
+	})
+	if err := s.saveRootPassword("proxy-pool", 0, "pool", string(entries)); err != nil {
+		t.Fatal(err)
+	}
+	s.egressLookup = func(_ context.Context, raw string) (string, error) {
+		if strings.Contains(raw, ":40002") {
+			return "203.0.113.55", nil
+		}
+		if strings.Contains(raw, "first.example") || strings.Contains(raw, ":40001") {
+			return "203.0.113.10", nil
+		}
+		return "203.0.113.20", nil
+	}
+	if _, err := s.verifyAccountEgress(context.Background(), ids[0]); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(map[string]any{"account_id": ids[1], "ids": []string{"shared", "unique"}})
+	result := apiRequest(newHandler(s), http.MethodPost, "/api/proxy-pool/test-egress-batch", string(body))
+	var response struct {
+		Results []proxyEgressBatchResult `json:"results"`
+	}
+	if err := json.Unmarshal(result.Body.Bytes(), &response); err != nil {
+		t.Fatal(err)
+	}
+	if result.Code != http.StatusOK || len(response.Results) != 2 {
+		t.Fatalf("batch egress test failed: %d %s", result.Code, result.Body.String())
+	}
+	if response.Results[0].IP != "203.0.113.10" || response.Results[0].Available || len(response.Results[0].Conflicts) != 1 || response.Results[0].Conflicts[0].AccountName != "first" {
+		t.Fatalf("shared egress collision not reported: %+v", response.Results[0])
+	}
+	if response.Results[1].IP != "203.0.113.55" || !response.Results[1].Available {
+		t.Fatalf("distinct exit IP was not available: %+v", response.Results[1])
+	}
+	if strings.Contains(result.Body.String(), "secret") {
+		t.Fatal("batch proxy test response exposed credentials")
+	}
+	if _, ok := s.credentials.token("account-egress-" + ids[1] + "/0"); ok {
+		t.Fatal("batch egress test unexpectedly recorded account usage")
+	}
+}

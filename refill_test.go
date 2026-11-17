@@ -87,8 +87,8 @@ func TestAccountEgressIsolationPersistenceAndNoFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.egressLookup = func(context.Context, string) (string, error) { return "203.0.113.10", nil }
-	if _, err := s.verifyAccountEgress(context.Background(), ids[1]); err == nil {
-		t.Fatal("shared IP accepted through different proxies")
+	if _, err := s.verifyAccountEgress(context.Background(), ids[1]); err == nil || !strings.Contains(err.Error(), "203.0.113.10") || !strings.Contains(err.Error(), "first") || !strings.Contains(err.Error(), "second.example:8080") {
+		t.Fatalf("shared IP should be blocked with the conflicting account and endpoints shown: %v", err)
 	}
 	var calls atomic.Int32
 	s.linodeHook = func(context.Context, string, string, string, io.Reader) ([]byte, int, error) {

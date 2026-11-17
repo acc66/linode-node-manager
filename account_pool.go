@@ -89,6 +89,12 @@ func (s *Server) verifyAccountEgress(ctx context.Context, account string) (strin
 		return "", errors.New("代理出口 IP 无效")
 	}
 	ip = parsed.String()
+	accountNames := map[string]string{"legacy": "默认账号 (.env)"}
+	if s.accounts != nil {
+		for _, managed := range s.accounts.list() {
+			accountNames[managed.ID] = managed.Name
+		}
+	}
 	store := s.credentials
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -118,7 +124,11 @@ func (s *Server) verifyAccountEgress(ctx context.Context, account string) (strin
 		}
 		for _, seen := range prior.Records {
 			if seen.IP == ip {
-				return "", errors.New("该出口 IP 已被其他账号使用，已阻止 Linode 请求；请更换独立出口")
+				name := accountNames[prior.Account]
+				if name == "" {
+					name = prior.Account
+				}
+				return "", fmt.Errorf("出口 IP %s 已由账号「%s」经代理 %s 使用；当前代理 %s 也出口到此 IP，已阻止 Linode 请求。请更换独立公网出口（只改端口无效）", ip, name, seen.Proxy, endpoint)
 			}
 		}
 	}

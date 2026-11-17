@@ -82,6 +82,12 @@ func TestBatchProxyPoolEgressReportsEveryIPAndHistoryOwner(t *testing.T) {
 		}
 		return "203.0.113.20", nil
 	}
+	s.egressLookupIPv6 = func(_ context.Context, raw string) (string, error) {
+		if strings.Contains(raw, ":40001") {
+			return "2606:4700:4700::1111", nil
+		}
+		return "2001:4860:4860::8888", nil
+	}
 	if _, err := s.verifyAccountEgress(context.Background(), ids[0]); err != nil {
 		t.Fatal(err)
 	}
@@ -96,10 +102,10 @@ func TestBatchProxyPoolEgressReportsEveryIPAndHistoryOwner(t *testing.T) {
 	if result.Code != http.StatusOK || len(response.Results) != 2 {
 		t.Fatalf("batch egress test failed: %d %s", result.Code, result.Body.String())
 	}
-	if response.Results[0].IP != "203.0.113.10" || response.Results[0].Available || len(response.Results[0].Conflicts) != 1 || response.Results[0].Conflicts[0].AccountName != "first" {
+	if response.Results[0].IPv4 != "203.0.113.10" || response.Results[0].IPv6 != "2606:4700:4700::1111" || response.Results[0].Available || len(response.Results[0].Conflicts) != 1 || response.Results[0].Conflicts[0].AccountName != "first" {
 		t.Fatalf("shared egress collision not reported: %+v", response.Results[0])
 	}
-	if response.Results[1].IP != "203.0.113.55" || !response.Results[1].Available {
+	if response.Results[1].IPv4 != "203.0.113.55" || response.Results[1].IPv6 != "2001:4860:4860::8888" || !response.Results[1].Available {
 		t.Fatalf("distinct exit IP was not available: %+v", response.Results[1])
 	}
 	if strings.Contains(result.Body.String(), "secret") {

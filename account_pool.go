@@ -44,13 +44,26 @@ func (s *Server) lookupEgress(ctx context.Context, raw string) (string, error) {
 	if s.egressLookup != nil {
 		return s.egressLookup(ctx, raw)
 	}
+	return s.lookupEgressEndpoint(ctx, raw, env("EGRESS_CHECK_URL", "https://api4.ipify.org?format=json"))
+}
+
+func (s *Server) lookupEgressIPv6(ctx context.Context, raw string) (string, error) {
+	if s.egressLookupIPv6 != nil {
+		return s.egressLookupIPv6(ctx, raw)
+	}
+	if s.egressLookup != nil {
+		return "", errors.New("IPv6 检测未配置")
+	}
+	return s.lookupEgressEndpoint(ctx, raw, env("EGRESS_CHECK_URL_IPV6", "https://api6.ipify.org?format=json"))
+}
+
+func (s *Server) lookupEgressEndpoint(ctx context.Context, raw, endpoint string) (string, error) {
 	client, err := proxyClient(s.client, raw)
 	if err != nil {
 		return "", err
 	}
 	defer client.CloseIdleConnections()
 	client.Timeout = 12 * time.Second
-	endpoint := env("EGRESS_CHECK_URL", "https://api.ipify.org?format=json")
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
 		return "", errors.New("出口检测地址必须是 HTTPS")
@@ -74,6 +87,9 @@ func (s *Server) lookupEgress(ctx context.Context, raw string) (string, error) {
 	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() {
 		return "", errors.New("出口检测未返回公网 IP")
 	}
+	if strings.Contains(u.Hostname(), "api6.") && ip.To4() != nil {
+		return "", errors.New("代理没有可用的 IPv6 出口")
+	}
 	return ip.String(), nil
 }
 
@@ -90,7 +106,7 @@ func (s *Server) verifyAccountEgress(ctx context.Context, account string) (strin
 		return "", err
 	}
 	parsed := net.ParseIP(ip)
-	if parsed == nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() {
+	if parsed == nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() || parsed.To4() == nil {
 		return "", errors.New("代理出口 IP 无效")
 	}
 	ip = parsed.String()
@@ -285,7 +301,7 @@ func (s *Server) proxyPoolEgressTestAPI(w http.ResponseWriter, r *http.Request) 
 		fail(w, 404, "代理不存在，请刷新代理池")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 	defer cancel()
 	ip, err := s.lookupEgress(ctx, raw)
 	if err != nil {
@@ -293,11 +309,17 @@ func (s *Server) proxyPoolEgressTestAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	parsed := net.ParseIP(strings.TrimSpace(ip))
-	if parsed == nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() {
+	if parsed == nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() || parsed.To4() == nil {
 		fail(w, 502, "代理出口检测未返回有效公网 IP")
 		return
 	}
 	ip = parsed.String()
+	ipv6 := ""
+	if value, v6err := s.lookupEgressIPv6(ctx, raw); v6err == nil {
+		if parsed6 := net.ParseIP(strings.TrimSpace(value)); parsed6 != nil && parsed6.IsGlobalUnicast() && !parsed6.IsPrivate() && parsed6.To4() == nil {
+			ipv6 = parsed6.String()
+		}
+	}
 	store := s.credentials
 	store.mu.RLock()
 	endpoint, endpointErr := proxyEndpointLocked(store, "pool:"+proxyID)
@@ -307,13 +329,31 @@ func (s *Server) proxyPoolEgressTestAPI(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	store.mu.RUnlock()
-	conflicts, conflictErr := s.egressConflicts(ip, account)
-	if conflictErr != nil {
-		fail(w, 500, conflictErr.Error())
-		return
+	conflicts := []egressConflict{}
+	for _, detectedIP := range []string{ip, ipv6} {
+		if detectedIP == "" {
+			continue
+		}
+		found, conflictErr := s.egressConflicts(detectedIP, account)
+		if conflictErr != nil {
+			fail(w, 500, conflictErr.Error())
+			return
+		}
+		for _, conflict := range found {
+			duplicate := false
+			for _, existing := range conflicts {
+				if existing.AccountID == conflict.AccountID && existing.Proxy == conflict.Proxy {
+					duplicate = true
+					break
+				}
+			}
+			if !duplicate {
+				conflicts = append(conflicts, conflict)
+			}
+		}
 	}
 	send(w, 200, map[string]any{
-		"ip": ip, "proxy": endpoint, "available": len(conflicts) == 0,
+		"ip": ip, "ipv4": ip, "ipv6": ipv6, "proxy": endpoint, "available": len(conflicts) == 0,
 		"conflicts": conflicts,
 	})
 }

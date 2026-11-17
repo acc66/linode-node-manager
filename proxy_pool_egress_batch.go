@@ -16,6 +16,8 @@ type proxyEgressBatchResult struct {
 	Name      string           `json:"name"`
 	Address   string           `json:"address"`
 	IP        string           `json:"ip,omitempty"`
+	IPv4      string           `json:"ipv4,omitempty"`
+	IPv6      string           `json:"ipv6,omitempty"`
 	Available bool             `json:"available"`
 	Conflicts []egressConflict `json:"conflicts,omitempty"`
 	Error     string           `json:"error,omitempty"`
@@ -81,33 +83,58 @@ func (s *Server) proxyPoolEgressBatchAPI(w http.ResponseWriter, r *http.Request)
 					continue
 				}
 				result.Address = endpoint
-				ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+				ctx, cancel := context.WithTimeout(r.Context(), 25*time.Second)
 				ip, err := s.lookupEgress(ctx, entry.URL)
-				cancel()
 				if err != nil {
+					cancel()
 					result.Error = "出口检测失败：" + safeProxyFailure(err)
 					results[index] = result
 					continue
 				}
 				parsed := net.ParseIP(strings.TrimSpace(ip))
-				if parsed == nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() {
+				if parsed == nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() || parsed.To4() == nil {
+					cancel()
 					result.Error = "未返回有效公网出口 IP"
 					results[index] = result
 					continue
 				}
-				result.IP = parsed.String()
+				result.IP, result.IPv4 = parsed.String(), parsed.String()
+				ipv6, ipv6Err := s.lookupEgressIPv6(ctx, entry.URL)
+				cancel()
+				if ipv6Err == nil {
+					parsed6 := net.ParseIP(strings.TrimSpace(ipv6))
+					if parsed6 != nil && parsed6.IsGlobalUnicast() && !parsed6.IsPrivate() && parsed6.To4() == nil {
+						result.IPv6 = parsed6.String()
+					}
+				}
 				if current, exists := s.poolURL(entry.ID); !exists || current != entry.URL {
 					result.Error = "检测期间代理资料已变化，请重试"
 					results[index] = result
 					continue
 				}
-				conflicts, conflictErr := s.egressConflicts(result.IP, in.AccountID)
-				if conflictErr != nil {
-					result.Error = conflictErr.Error()
-				} else {
-					result.Conflicts = conflicts
-					result.Available = len(conflicts) == 0
+				for _, detectedIP := range []string{result.IPv4, result.IPv6} {
+					if detectedIP == "" {
+						continue
+					}
+					conflicts, conflictErr := s.egressConflicts(detectedIP, in.AccountID)
+					if conflictErr != nil {
+						result.Error = conflictErr.Error()
+						break
+					}
+					for _, conflict := range conflicts {
+						found := false
+						for _, existing := range result.Conflicts {
+							if existing.AccountID == conflict.AccountID && existing.Proxy == conflict.Proxy {
+								found = true
+								break
+							}
+						}
+						if !found {
+							result.Conflicts = append(result.Conflicts, conflict)
+						}
+					}
 				}
+				result.Available = result.Error == "" && len(result.Conflicts) == 0
 				results[index] = result
 			}
 		}()

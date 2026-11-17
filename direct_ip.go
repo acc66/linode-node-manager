@@ -87,7 +87,7 @@ func (s *Server) addDirectIPv4(ctx context.Context, op *IPChange, oldIP string) 
 	}
 	body := map[string]any{"type": "ipv4", "public": true}
 	if err := s.ipJSON(ctx, op.Job.AccountID, "POST", fmt.Sprintf("/linode/instances/%d/ips", op.Original.ID), body, &allocated); err != nil {
-		return "", nil, fmt.Errorf("Linode 未允许给原机分配额外公网 IPv4，旧 IP 保留：%w", err)
+		return "", nil, fmt.Errorf("Linode 未批准或无法分配额外公网 IPv4；账户可能需要先向 Linode Support 申请额外 IPv4 配额。旧 IP 保留：%w", err)
 	}
 	if net.ParseIP(allocated.Address).To4() == nil || allocated.Address == oldIP || (allocated.Linode != 0 && allocated.Linode != op.Original.ID) || (allocated.Region != "" && allocated.Region != op.Original.Region) || (allocated.Public == false && allocated.Linode != 0) {
 		return "", nil, errors.New("Linode 返回的新 IPv4 无效或归属不符；旧 IP 保留，请核对账号")
@@ -229,7 +229,12 @@ func (s *Server) runDirectIPChange(ctx context.Context, op *IPChange) (runErr er
 	newIP, iface, err := s.addDirectIPv4(ctx, op, oldIP)
 	if err != nil {
 		if wasRunning {
-			_, _ = s.bootAfterIPChange(context.WithoutCancel(ctx), account, original.ID, true, oldIP)
+			restored, restoreErr := s.bootAfterIPChange(context.WithoutCancel(ctx), account, original.ID, true, oldIP)
+			if restoreErr != nil {
+				s.ipJobLog(op, "额外 IPv4 未分配，正在恢复原 IP 开机失败；请立即在 Linode 核对并手动开机："+restoreErr.Error())
+			} else {
+				s.ipJobLog(op, fmt.Sprintf("额外 IPv4 未分配；原 IP %s 已保留，原机已恢复开机。", publicIP(restored)))
+			}
 		}
 		return err
 	}

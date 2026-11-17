@@ -54,6 +54,9 @@ func (s *Server) ipJSON(ctx context.Context, account, method, path string, input
 		return errors.New("Linode 请求结果未知，请刷新核对，勿重复提交")
 	}
 	if status < 200 || status >= 300 {
+		if reason := linodeAPIErrorReason(b); reason != "" {
+			return fmt.Errorf("Linode %s HTTP %d：%s", method, status, reason)
+		}
 		return fmt.Errorf("Linode %s HTTP %d，请检查权限、配额和资源状态", method, status)
 	}
 	if output != nil {
@@ -62,6 +65,32 @@ func (s *Server) ipJSON(ctx context.Context, account, method, path string, input
 		}
 	}
 	return nil
+}
+
+func linodeAPIErrorReason(body []byte) string {
+	var response struct {
+		Errors []struct {
+			Reason string `json:"reason"`
+		} `json:"errors"`
+	}
+	if json.Unmarshal(body, &response) != nil {
+		return ""
+	}
+	reasons := make([]string, 0, len(response.Errors))
+	for _, item := range response.Errors {
+		reason := strings.Join(strings.Fields(item.Reason), " ")
+		if reason == "" {
+			continue
+		}
+		if len(reason) > 240 {
+			reason = reason[:240]
+		}
+		reasons = append(reasons, reason)
+		if len(reasons) == 3 {
+			break
+		}
+	}
+	return strings.Join(reasons, "; ")
 }
 func (s *Server) ipInstance(ctx context.Context, account string, id int) (Instance, error) {
 	var i Instance
@@ -441,7 +470,7 @@ func (s *Server) ipChangePlanAPI(w http.ResponseWriter, r *http.Request) {
 			bound, _ = strconv.Atoi(raw)
 		}
 	}
-	send(w, 200, map[string]any{"instance": instance, "bound_node_id": bound, "billing_notice": "直接给原机申请第二个公网 IPv4，额外 IP 可能按 Linode 价格收费；账号需要有额外 IPv4 配额。只有新 IP 通过连接验证后才释放旧 IP。"})
+	send(w, 200, map[string]any{"instance": instance, "bound_node_id": bound, "billing_notice": "直接给原机申请第二个公网 IPv4；Linode 通常要求先向 Support 申请额外 IPv4 配额，批准后才可 API 分配，额外 IP 可能收费。只有新 IP 通过连接验证后才释放旧 IP。"})
 }
 func (s *Server) ipChangeAPI(w http.ResponseWriter, r *http.Request) {
 	if !s.refillMu.TryRLock() {

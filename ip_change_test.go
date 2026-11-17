@@ -79,6 +79,17 @@ func TestIPChangeDirectlyReplacesIPv4OnOriginal(t *testing.T) {
 		}
 	}
 }
+
+func TestLinodeAPIErrorReasonSurfacesAllocationLimit(t *testing.T) {
+	got := linodeAPIErrorReason([]byte(`{"errors":[{"reason":"Additional public IPv4 allocation requires support approval."}]}`))
+	if got != "Additional public IPv4 allocation requires support approval." {
+		t.Fatalf("unexpected Linode API reason: %q", got)
+	}
+	if got := linodeAPIErrorReason([]byte(`not json`)); got != "" {
+		t.Fatalf("malformed response should not leak body: %q", got)
+	}
+}
+
 func TestIPChangeRequiresConfirmationAndNetworkHelper(t *testing.T) {
 	t.Setenv("ADMIN_TOKEN", "ci-admin")
 	t.Setenv("LINODE_TOKEN", "mock")

@@ -214,3 +214,91 @@ func (s *Server) accountEgressAPI(w http.ResponseWriter, r *http.Request) {
 	}
 	send(w, 200, map[string]string{"ip": ip, "account_id": account})
 }
+
+// proxyPoolEgressTestAPI checks a pool proxy's real public exit before the user
+// binds it or sends any Linode API request. It never receives a Linode token
+// and does not add a record to an account's usage history.
+func (s *Server) proxyPoolEgressTestAPI(w http.ResponseWriter, r *http.Request) {
+	if s.credentials == nil {
+		fail(w, 503, "代理加密存储未配置")
+		return
+	}
+	account := r.URL.Query().Get("account_id")
+	if account == "" {
+		fail(w, 400, "请先选择要绑定代理的账号")
+		return
+	}
+	if _, err := s.accountToken(account); err != nil {
+		fail(w, 400, "账号不存在")
+		return
+	}
+	proxyID := r.PathValue("id")
+	raw, ok := s.poolURL(proxyID)
+	if !ok {
+		fail(w, 404, "代理不存在，请刷新代理池")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	ip, err := s.lookupEgress(ctx, raw)
+	if err != nil {
+		fail(w, 502, "代理出口检测失败："+safeProxyFailure(err))
+		return
+	}
+	parsed := net.ParseIP(strings.TrimSpace(ip))
+	if parsed == nil || !parsed.IsGlobalUnicast() || parsed.IsPrivate() {
+		fail(w, 502, "代理出口检测未返回有效公网 IP")
+		return
+	}
+	ip = parsed.String()
+	accountNames := map[string]string{"legacy": "默认账号 (.env)"}
+	if s.accounts != nil {
+		for _, managed := range s.accounts.list() {
+			accountNames[managed.ID] = managed.Name
+		}
+	}
+	conflicts := make([]map[string]string, 0)
+	store := s.credentials
+	store.mu.RLock()
+	endpoint, endpointErr := proxyEndpointLocked(store, "pool:"+proxyID)
+	if endpointErr != nil {
+		store.mu.RUnlock()
+		fail(w, 409, "代理池地址无效，请检查代理配置")
+		return
+	}
+	seenConflict := map[string]bool{}
+	for key, record := range store.accounts {
+		if !strings.HasPrefix(key, "account-egress-") {
+			continue
+		}
+		var history AccountEgress
+		if json.Unmarshal([]byte(record.Token), &history) != nil {
+			store.mu.RUnlock()
+			fail(w, 500, "账号出口记录损坏，无法验证代理独占性")
+			return
+		}
+		if history.Account == account {
+			continue
+		}
+		for _, used := range history.Records {
+			if used.IP != ip {
+				continue
+			}
+			key := history.Account + "\x00" + used.Proxy
+			if seenConflict[key] {
+				continue
+			}
+			seenConflict[key] = true
+			name := accountNames[history.Account]
+			if name == "" {
+				name = history.Account
+			}
+			conflicts = append(conflicts, map[string]string{"account_id": history.Account, "account_name": name, "proxy": used.Proxy})
+		}
+	}
+	store.mu.RUnlock()
+	send(w, 200, map[string]any{
+		"ip": ip, "proxy": endpoint, "available": len(conflicts) == 0,
+		"conflicts": conflicts,
+	})
+}
